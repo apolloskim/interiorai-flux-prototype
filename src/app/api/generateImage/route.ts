@@ -160,6 +160,31 @@ async function generateFurnishedImage(imageUrl: string, prompt: string): Promise
   }
 }
 
+async function detectObjects(imageUrl: string): Promise<any> {
+  try {
+    const result = await fal.subscribe(
+      "fal-ai/florence-2-large/object-detection",
+      {
+        input: {
+          image_url: imageUrl
+        },
+        logs: true,
+        onQueueUpdate: (update) => {
+          if (update.status === "IN_PROGRESS") {
+            update.logs.map((log) => log.message).forEach(console.log);
+          }
+        },
+      }
+    );
+
+    console.log("Object detection result:", result.data);
+    return result.data;
+  } catch (error) {
+    console.error("Error detecting objects:", error);
+    throw error;
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData()
@@ -196,18 +221,23 @@ export async function POST(request: NextRequest) {
     const griddedImageFile = new File([griddedImageBuffer], 'gridded-' + image.name, { type: 'image/jpeg' });
     const griddedImageUrl = await fal.storage.upload(griddedImageFile);
     
-    // Generate both maps and furnished image in parallel using original image
+    // First generate maps and furnished image
     const [cannyMapUrl, depthMapUrl, furnishedImageData] = await Promise.all([
       generateCannyMap(originalImageUrl, originalWidth, originalHeight),
       generateDepthMap(originalImageUrl, originalWidth, originalHeight),
       generateFurnishedImage(originalImageUrl, prompt)
-    ])
+    ]);
+
+    // Then use the furnished image URL for object detection
+    const furnishedImageUrl = furnishedImageData.images[0].url;
+    const objectDetectionData = await detectObjects(furnishedImageUrl);
 
     console.log("Original image URL:", originalImageUrl)
     console.log("Gridded image URL:", griddedImageUrl)
     console.log("Resized Canny map URL:", cannyMapUrl)
     console.log("Resized Depth map URL:", depthMapUrl)
     console.log("Furnished image data:", JSON.stringify(furnishedImageData, null, 2))
+    console.log("Object detection data:", JSON.stringify(objectDetectionData, null, 2))
 
     return NextResponse.json({ 
       success: true, 
