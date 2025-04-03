@@ -1,10 +1,20 @@
 import { NextRequest, NextResponse } from "next/server"
 import { fal } from "@fal-ai/client"
 import sharp from 'sharp'
+import OpenAI from 'openai'
+import fs from 'fs'
 
 if (!process.env.FAL_KEY) {
   throw new Error("FAL_KEY environment variable is not set")
 }
+
+if (!process.env.OPENAI_API_KEY) {
+  throw new Error("OPENAI_API_KEY environment variable is not set")
+}
+
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
 async function getImageDimensions(buffer: Buffer): Promise<{ width: number; height: number }> {
   const metadata = await sharp(buffer).metadata();
@@ -201,6 +211,80 @@ async function detectObjects(imageUrl: string): Promise<any> {
   }
 }
 
+async function analyzeImageWithVision(imageUrl: string, griddedImageUrl: string, cannyUrl: string, griddedCannyUrl: string, depthUrl: string, griddedDepthUrl: string, furnishedImageUrl: string, florenceJson: any, userPrompt: string, imageWidth: number, imageHeight: number) {
+  if (!process.env.OPENAI_API_KEY) {
+    throw new Error('Missing OpenAI API key');
+  }
+
+  const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+  });
+
+  // Read the prompt template
+  const promptTemplate = fs.readFileSync('src/app/utils/goated-gpt-4o-prompt.txt', 'utf8');
+  
+  // Replace placeholders with actual values
+  const filledPrompt = promptTemplate
+    .replace('[Placeholder: Image resolution, e.g. 1024x768]', `${imageWidth}x${imageHeight}`)
+    .replace('[PASTE FLORENCE JSON HERE]', JSON.stringify(florenceJson, null, 2))
+    .replace('[PASTE USER PROMPT HERE]', userPrompt)
+    .replace('[placeholder above]', `${imageWidth}x${imageHeight}`)
+
+  console.log(`#### filledPrompt: ${filledPrompt}\n\n\n\n`);
+
+  const response = await openai.responses.create({
+    model: "gpt-4o-2024-11-20", // don't change this
+    input: [
+      {
+        role: "user",
+        content: [
+          { type: "input_text", text: filledPrompt },
+          {
+            type: "input_image",
+            image_url: imageUrl,
+            detail: "high"
+          },
+          {
+            type: "input_image",
+            image_url: griddedImageUrl,
+            detail: "high"
+          },
+          {
+            type: "input_image",
+            image_url: cannyUrl,
+            detail: "high"
+          },
+          {
+            type: "input_image",
+            image_url: griddedCannyUrl,
+            detail: "high"
+          },
+          {
+            type: "input_image",
+            image_url: depthUrl,
+            detail: "high"
+          },
+          {
+            type: "input_image",
+            image_url: griddedDepthUrl,
+            detail: "high"
+          },
+          {
+            type: "input_image",
+            image_url: furnishedImageUrl,
+            detail: "high"
+          }
+        ]
+      }
+    ]
+  });
+
+  console.log(`#### response: ${JSON.stringify(response)}\n\n\n\n`);
+
+  console.log("GPT-4o Response:", response.output_text);
+  return response.output_text;
+}
+
 export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData()
@@ -247,18 +331,32 @@ export async function POST(request: NextRequest) {
     const furnishedImageUrl = furnishedImageData.images[0].url;
     const objectDetectionData = await detectObjects(furnishedImageUrl);
 
-    console.log("Original image URL:", originalImageUrl)
-    console.log("Gridded image URL:", griddedImageUrl)
-    console.log("Canny map URLs:", {
-      original: cannyMaps.original,
-      gridded: cannyMaps.gridded
-    })
-    console.log("Depth map URLs:", {
-      original: depthMaps.original,
-      gridded: depthMaps.gridded
-    })
-    console.log("Furnished image data:", JSON.stringify(furnishedImageData, null, 2))
-    console.log("Object detection data:", JSON.stringify(objectDetectionData, null, 2))
+    // Analyze the image using GPT-4o with all context
+    const analysis = await analyzeImageWithVision(
+      originalImageUrl,
+      griddedImageUrl,
+      cannyMaps.original,
+      cannyMaps.gridded,
+      depthMaps.original,
+      depthMaps.gridded,
+      furnishedImageUrl,
+      objectDetectionData,
+      prompt,
+      originalWidth,
+      originalHeight
+    );
+
+    // Log all generated URLs
+    console.log({
+      originalImage: originalImageUrl,
+      griddedImage: griddedImageUrl,
+      cannyMap: cannyMaps.original,
+      griddedCannyMap: cannyMaps.gridded, 
+      depthMap: depthMaps.original,
+      griddedDepthMap: depthMaps.gridded,
+      furnishedImage: furnishedImageUrl,
+      analysis
+    });
 
     return NextResponse.json({ 
       success: true, 
