@@ -14,25 +14,25 @@ async function getImageDimensions(buffer: Buffer): Promise<{ width: number; heig
   return { width: metadata.width, height: metadata.height };
 }
 
-async function createGridOverlay(width: number, height: number, gridSize: number = 50): Promise<Buffer> {
-  // Create SVG with grid lines
+async function createGridOverlay(width: number, height: number): Promise<Buffer> {
+  // Create SVG with 50px grid lines but 100px coordinate labels
   const svg = `
     <svg width="${width}" height="${height}">
       <defs>
-        <pattern id="grid" width="${gridSize}" height="${gridSize}" patternUnits="userSpaceOnUse">
-          <path d="M ${gridSize} 0 L 0 0 0 ${gridSize}" fill="none" stroke="rgba(255,255,255,0.5)" stroke-width="1"/>
+        <pattern id="grid" width="50" height="50" patternUnits="userSpaceOnUse">
+          <path d="M 50 0 L 0 0 0 50" fill="none" stroke="rgba(200,200,200,0.5)" stroke-width="0.5"/>
         </pattern>
       </defs>
       <rect width="100%" height="100%" fill="url(#grid)" />
       
-      <!-- Add numbers on the top -->
-      ${Array.from({ length: Math.floor(width / gridSize) }, (_, i) => 
-        `<text x="${i * gridSize + 5}" y="20" fill="white" font-size="12">${i * gridSize}</text>`
+      <!-- Add numbers every 100px on the top -->
+      ${Array.from({ length: Math.floor(width / 100) }, (_, i) => 
+        `<text x="${i * 100 + 2}" y="10" fill="rgba(200,200,200,0.8)" font-size="10">${i * 100}</text>`
       ).join('')}
       
-      <!-- Add numbers on the left -->
-      ${Array.from({ length: Math.floor(height / gridSize) }, (_, i) => 
-        `<text x="5" y="${i * gridSize + 20}" fill="white" font-size="12">${i * gridSize}</text>`
+      <!-- Add numbers every 100px on the left -->
+      ${Array.from({ length: Math.floor(height / 100) }, (_, i) => 
+        `<text x="2" y="${i * 100 + 10}" fill="rgba(200,200,200,0.8)" font-size="10">${i * 100}</text>`
       ).join('')}
     </svg>`;
 
@@ -66,7 +66,7 @@ async function resizeImage(imageUrl: string, targetWidth: number, targetHeight: 
     .toBuffer();
 }
 
-async function generateCannyMap(imageUrl: string, originalWidth: number, originalHeight: number): Promise<string> {
+async function generateCannyMap(imageUrl: string, originalWidth: number, originalHeight: number): Promise<{ original: string; gridded: string }> {
   try {
     const result = await fal.subscribe("fal-ai/image-preprocessors/canny", {
       input: {
@@ -86,15 +86,23 @@ async function generateCannyMap(imageUrl: string, originalWidth: number, origina
     // Upload the resized canny map
     const resizedCannyFile = new File([resizedCannyBuffer], 'resized-canny.jpg', { type: 'image/jpeg' });
     const resizedCannyUrl = await fal.storage.upload(resizedCannyFile);
+
+    // Add grid to the resized canny map and upload
+    const griddedCannyBuffer = await addGridToImage(resizedCannyBuffer);
+    const griddedCannyFile = new File([griddedCannyBuffer], 'gridded-canny.jpg', { type: 'image/jpeg' });
+    const griddedCannyUrl = await fal.storage.upload(griddedCannyFile);
     
-    return resizedCannyUrl;
+    return {
+      original: resizedCannyUrl,
+      gridded: griddedCannyUrl
+    };
   } catch (error) {
     console.error("Error generating canny map:", error);
     throw error;
   }
 }
 
-async function generateDepthMap(imageUrl: string, originalWidth: number, originalHeight: number): Promise<string> {
+async function generateDepthMap(imageUrl: string, originalWidth: number, originalHeight: number): Promise<{ original: string; gridded: string }> {
   try {
     const result = await fal.subscribe("fal-ai/imageutils/depth", {
       input: {
@@ -114,8 +122,16 @@ async function generateDepthMap(imageUrl: string, originalWidth: number, origina
     // Upload the resized depth map
     const resizedDepthFile = new File([resizedDepthBuffer], 'resized-depth.jpg', { type: 'image/jpeg' });
     const resizedDepthUrl = await fal.storage.upload(resizedDepthFile);
+
+    // Add grid to the resized depth map and upload
+    const griddedDepthBuffer = await addGridToImage(resizedDepthBuffer);
+    const griddedDepthFile = new File([griddedDepthBuffer], 'gridded-depth.jpg', { type: 'image/jpeg' });
+    const griddedDepthUrl = await fal.storage.upload(griddedDepthFile);
     
-    return resizedDepthUrl;
+    return {
+      original: resizedDepthUrl,
+      gridded: griddedDepthUrl
+    };
   } catch (error) {
     console.error("Error generating depth map:", error);
     throw error;
@@ -189,7 +205,6 @@ export async function POST(request: NextRequest) {
   try {
     const formData = await request.formData()
     const image = formData.get("image") as File
-    // Check for either prompt or text in the form data
     const prompt = (formData.get("prompt") || formData.get("text")) as string
 
     if (!image) {
@@ -222,7 +237,7 @@ export async function POST(request: NextRequest) {
     const griddedImageUrl = await fal.storage.upload(griddedImageFile);
     
     // First generate maps and furnished image
-    const [cannyMapUrl, depthMapUrl, furnishedImageData] = await Promise.all([
+    const [cannyMaps, depthMaps, furnishedImageData] = await Promise.all([
       generateCannyMap(originalImageUrl, originalWidth, originalHeight),
       generateDepthMap(originalImageUrl, originalWidth, originalHeight),
       generateFurnishedImage(originalImageUrl, prompt)
@@ -234,8 +249,14 @@ export async function POST(request: NextRequest) {
 
     console.log("Original image URL:", originalImageUrl)
     console.log("Gridded image URL:", griddedImageUrl)
-    console.log("Resized Canny map URL:", cannyMapUrl)
-    console.log("Resized Depth map URL:", depthMapUrl)
+    console.log("Canny map URLs:", {
+      original: cannyMaps.original,
+      gridded: cannyMaps.gridded
+    })
+    console.log("Depth map URLs:", {
+      original: depthMaps.original,
+      gridded: depthMaps.gridded
+    })
     console.log("Furnished image data:", JSON.stringify(furnishedImageData, null, 2))
     console.log("Object detection data:", JSON.stringify(objectDetectionData, null, 2))
 
