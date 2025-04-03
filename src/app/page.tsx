@@ -6,6 +6,7 @@ import { PromptInput } from "@/components/prompt-input"
 import { Button } from "@/components/ui/button"
 import { Loader2 } from "lucide-react"
 import { cn } from "@/lib/utils"
+import { Label } from "@/components/ui/label"
 
 export default function Home() {
   const [uploadedImage, setUploadedImage] = useState<string | null>(null)
@@ -13,6 +14,7 @@ export default function Home() {
   const [generatedImage, setGeneratedImage] = useState<string | null>(null)
   const [isGenerating, setIsGenerating] = useState(false)
   const [isTransitioning, setIsTransitioning] = useState(false)
+  const [selectedModel, setSelectedModel] = useState<'gpt4o' | 'gemini'>('gpt4o')
 
   const handleGenerate = async () => {
     if (!uploadedImage || !prompt.trim()) return
@@ -29,6 +31,7 @@ export default function Home() {
       const formData = new FormData()
       formData.append('image', blob, 'image.jpg')
       formData.append('text', prompt)
+      formData.append('model', selectedModel)
 
       // Call our API endpoint
       const result = await fetch('/api/generateImage', {
@@ -76,6 +79,34 @@ export default function Home() {
 
           <div className="space-y-6">
             <ImageUploader onImageUploaded={setUploadedImage} uploadedImage={uploadedImage} compact={true} />
+
+            <div className="space-y-2">
+              <Label className="text-sm font-medium">Model Selection</Label>
+              <div className="flex space-x-4">
+                <label className="flex items-center space-x-2">
+                  <input
+                    type="radio"
+                    name="model"
+                    value="gpt4o"
+                    checked={selectedModel === 'gpt4o'}
+                    onChange={(e) => setSelectedModel(e.target.value as 'gpt4o' | 'gemini')}
+                    className="h-4 w-4 text-primary"
+                  />
+                  <span className="text-sm">GPT-4o</span>
+                </label>
+                <label className="flex items-center space-x-2">
+                  <input
+                    type="radio"
+                    name="model"
+                    value="gemini"
+                    checked={selectedModel === 'gemini'}
+                    onChange={(e) => setSelectedModel(e.target.value as 'gpt4o' | 'gemini')}
+                    className="h-4 w-4 text-primary"
+                  />
+                  <span className="text-sm">Gemini</span>
+                </label>
+              </div>
+            </div>
 
             <PromptInput
               value={prompt}
