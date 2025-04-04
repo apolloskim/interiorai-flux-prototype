@@ -86,6 +86,10 @@ GUARDRAILS & CONSTRAINTS (Reiteration & Emphasis):
 - REALISTIC PLACEMENT: Ground objects correctly based on spatial_anchor and control_depth.png. Respect perspective and scale of the empty room. No floating objects (unless logical, e.g., lights).
 - STYLE CONSISTENCY: Use user_style_prompt.txt as the definitive guide for object styles, materials, colors, and overall aesthetic. Ensure individual object prompts are rich and consistent.
 - RESPECT STRUCTURAL EDGES: Use control_canny.png to avoid placing object bounding boxes such that they illogically intersect major architectural features (window frames, corners, beams) unless the object realistically would (e.g., painting on a wall corner). Ignore minor Canny lines from shadows/reflections.
+- **PERSPECTIVE AWARENESS (Placement & Scale):** Ensure bounding box positions *and sizes* appear plausible given the perspective visible in `input_empty.png` and implied by `control_depth.png`.
+    *   Objects intended to be deeper/farther away should generally be placed **higher in the image (smaller Y coords)** and have **smaller bounding boxes (height and width)**.
+    *   Objects closer to the camera should be placed **lower in the image (larger Y coords)** and have **larger bounding boxes**.
+- **REALISTIC SCALE:** Ensure bounding boxes represent plausible real-world dimensions for the objects described, scaled correctly according to the perspective placement detailed above.
 - NO COMMENTARY: Output ONLY the raw JSON object.
 - BOUNDING BOX FORMAT: Must be [xmin, ymin, xmax, ymax] integer array.
 

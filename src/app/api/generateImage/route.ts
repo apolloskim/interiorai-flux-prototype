@@ -963,6 +963,63 @@ export async function POST(request: NextRequest) {
 
      console.log("\n--- Mask Generation & Execution Loop Finished ---");
 
+     // --- FINAL REFINEMENT STEP (Image-to-Image) ---
+     console.log("\n--- Starting Final Refinement Step (Image-to-Image) ---");
+     if (currentImageUrl && currentImageUrl !== originalImageUrl) { // Check if any inpainting actually happened
+         try {
+             const finalPrompt = userPrompt; // Use the original user prompt
+             const refinementInput = {
+                 image_url: currentImageUrl, // Use the result from the last inpainting step
+                 prompt: finalPrompt,
+                 strength: 0.5,
+                 max_shift: 1.15,
+                 base_shift: 0.5,
+                 num_images: 1,
+                 controlnets: [],
+                 ip_adapters: [],
+                 reference_end: 1,
+                 guidance_scale: 6.5,
+                 real_cfg_scale: 3.5,
+                 controlnet_unions: [],
+                 reference_strength: 0.65,
+                 num_inference_steps: 29,
+                 enable_safety_checker: true
+             };
+
+             console.log("Calling final image-to-image refinement...");
+             console.log("Refinement Payload:", JSON.stringify(refinementInput, null, 2));
+
+             const refinementResult = await fal.subscribe("fal-ai/flux-general/image-to-image", {
+                 input: refinementInput,
+                 logs: true,
+                 onQueueUpdate: (update) => {
+                     if (update.status === "IN_PROGRESS") {
+                         update.logs.map((log) => log.message).forEach(msg => console.log(`[Refinement Step]: ${msg}`));
+                     }
+                 },
+             });
+
+             const refinedImageUrl = (refinementResult?.data as any)?.images?.[0]?.url;
+             if (typeof refinedImageUrl !== 'string' || !refinedImageUrl) {
+                 console.error("Refinement response structure:", JSON.stringify(refinementResult, null, 2));
+                 throw new Error("Refined image URL not found or invalid in refinement response");
+             }
+
+             console.log(`Final refinement successful. Final image URL: ${refinedImageUrl}`);
+             finalGeneratedImageUrl = refinedImageUrl; // Update the final tracker
+
+         } catch (refinementError) {
+             console.error(`Failed during final refinement step:`, refinementError);
+             // Decide if this is fatal. We still have the result from the last inpaint step.
+             // For now, log the error but proceed with the pre-refinement image.
+             console.warn(`Proceeding with pre-refinement image URL: ${finalGeneratedImageUrl}`);
+             // Optionally, return an error or add a note to the response
+         }
+     } else {
+         console.log("Skipping final refinement step as no inpainting was performed or initial image URL is missing.");
+     }
+     // --- END FINAL REFINEMENT STEP ---
+
 
     // --- Final Logging and Response ---
     console.log("\n--- Final Results (After Inpainting) ---");
