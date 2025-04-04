@@ -3,6 +3,7 @@ import { fal } from "@fal-ai/client"
 import sharp from 'sharp'
 import OpenAI from 'openai'
 import { analyzeImageWithGemini } from '@/app/utils/gemini'
+import fs from 'fs'
 
 if (!process.env.FAL_KEY) {
   throw new Error("FAL_KEY environment variable is not set")
@@ -245,148 +246,119 @@ async function analyzeImageWithVision(
   }
 }
 
-export async function POST(request: NextRequest) {
-  try {
-    const formData = await request.formData()
-    const image = formData.get("image") as File
-    const prompt = (formData.get("prompt") || formData.get("text")) as string
-    const model = (formData.get("model") || 'gpt4o') as 'gpt4o' | 'gemini'
+// Helper Function to Prepare Gemini Prompt
+function prepareGeminiPrompt(
+    validationFeedback: string, // Pass errors as a formatted string or empty string
+    florenceResults: any,
+    userPrompt: string,
+    imageWidth: number,
+    imageHeight: number
+): string {
+    const promptTemplate = fs.readFileSync('src/app/utils/goated-gemini-prompt.txt', 'utf8');
+    return promptTemplate
+        .replace('[VALIDATION_FEEDBACK_SECTION]', validationFeedback) // Insert feedback
+        .replace('[PLACEHOLDER FOR IMAGE_DIMENSIONS]', `${imageWidth}x${imageHeight}`)
+        .replace('[PLACEHOLDER FOR USER_STYLE_PROMPT]', userPrompt)
+        .replace('[PLACEHOLDER FOR FLORENCE_JSON]', JSON.stringify(florenceResults));
+}
 
-    if (!image) {
-      return NextResponse.json(
-        { success: false, error: "No image provided" },
-        { status: 400 }
-      )
-    }
-
-    if (!prompt) {
-      return NextResponse.json(
-        { success: false, error: "No prompt provided" },
-        { status: 400 }
-      )
-    }
-
-    console.log("Received prompt:", prompt);
-
-    // Get original image dimensions and create gridded version
-    const imageBuffer = Buffer.from(await image.arrayBuffer());
-    const { width: originalWidth, height: originalHeight } = await getImageDimensions(imageBuffer);
-    console.log("Original image dimensions:", { width: originalWidth, height: originalHeight });
-
-    // Upload original image
-    const originalImageUrl = await fal.storage.upload(image);
-    
-    // First generate maps
-    const [cannyMapUrl, depthMapUrl] = await Promise.all([
-      generateCannyMap(originalImageUrl, originalWidth, originalHeight),
-      generateDepthMap(originalImageUrl, originalWidth, originalHeight),
-    ]);
-
-    // Generate the final furnished image using the analysis as the prompt
-    const furnishedImageUrl = await generateFurnishedImage(originalImageUrl, prompt);
-
-    // Get the furniture list from SA2VA
-    const furnitureList = await getFurnitureListFromSA2VA(furnishedImageUrl);
-
-    // Get grounding data from Florence-2
-    const groundingData = await getGroundingDataFromFlorence(furnishedImageUrl, furnitureList);
-    const florenceResults = groundingData.results;
-    
-
-    // // Analyze the image using GPT-4o with all context
-    const analysisString = await analyzeImageWithVision(
-      originalImageUrl,
-      depthMapUrl,
-      cannyMapUrl,
-      furnishedImageUrl,
-      florenceResults,
-      prompt,
-      originalWidth,
-      originalHeight,
-      model
-    );
-
-    // // Ensure analysis is valid before proceeding
-    if (typeof analysisString !== 'string' || !analysisString) {
-      console.error("Analysis result is not a valid string:", analysisString);
-      throw new Error("Failed to get valid analysis string from vision model");
-    }
-    
-    // --- NEW: Parse the analysis string and extract structured_layout ---
+// Helper Function to Parse Gemini Response
+function parseGeminiResponse(analysisString: string | null | undefined): { structuredLayout: any[] | null, executionPlan: any[] | null } {
     let structuredLayout = null;
     let executionPlan = null;
-    let analysisJson = null; // To hold the full parsed object
+
+    if (typeof analysisString !== 'string' || !analysisString) {
+        console.error("Analysis result is null or not a string:", analysisString);
+        return { structuredLayout, executionPlan };
+    }
+
+    let jsonStringToParse = analysisString.trim(); // Trim whitespace first
+    let didExtract = false;
+
+    // Try extracting content if fences are present
+    if (jsonStringToParse.startsWith("```json") && jsonStringToParse.endsWith("```")) {
+        console.log("Detected JSON fences. Attempting to extract content between first '{' and last '}'.");
+        const startIndex = jsonStringToParse.indexOf('{');
+        const endIndex = jsonStringToParse.lastIndexOf('}');
+
+        if (startIndex !== -1 && endIndex !== -1 && endIndex > startIndex) {
+            jsonStringToParse = jsonStringToParse.substring(startIndex, endIndex + 1);
+            console.log("Successfully extracted substring between braces.");
+            didExtract = true;
+        } else {
+            console.warn("Found fences but failed to find valid start/end braces '{}'. Will attempt to parse the trimmed string without fences.");
+             // Fallback: try removing fences crudely if brace finding failed
+             jsonStringToParse = jsonStringToParse.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+        }
+    } else {
+        console.log("No JSON fences detected. Attempting to parse the string directly.");
+    }
 
     try {
-      // --- UPDATED CLEANING LOGIC ---
-      let jsonStringToParse = analysisString; // Assume no fences initially
-      const match = analysisString.match(/^```json\s*([\s\S]*?)\s*```$/); 
-      // Check if the regex matched and captured content (group 1)
-      if (match && match[1]) {
-        jsonStringToParse = match[1]; // Use only the captured content
-        console.log("Extracted JSON content from fences.");
-      } else {
-        console.log("No JSON fences found, attempting to parse original string.");
-      }
-      // --- END UPDATED CLEANING LOGIC ---
-      
-      // Parse the potentially cleaned string
-      analysisJson = JSON.parse(jsonStringToParse); 
-      
-      if (analysisJson && typeof analysisJson === 'object') {
-        structuredLayout = analysisJson.structured_layout;
-        executionPlan = analysisJson.execution_plan; // Also extract execution_plan if needed later
+        const analysisJson = JSON.parse(jsonStringToParse);
+        // console.log("Successfully parsed JSON content."); // Keep log minimal on success
+
+        if (analysisJson && typeof analysisJson === 'object') {
+             if (Array.isArray(analysisJson.structured_layout)) {
+                 structuredLayout = analysisJson.structured_layout;
+                 // console.log("Successfully extracted structured_layout.");
+             } else {
+                  console.error("Parsed JSON does not contain a valid 'structured_layout' array.");
+             }
+             if (Array.isArray(analysisJson.execution_plan)) {
+                 executionPlan = analysisJson.execution_plan;
+                  // console.log("Successfully extracted execution_plan.");
+             } else {
+                  console.error("Parsed JSON does not contain a valid 'execution_plan' array.");
+             }
+           } else {
+              console.error("Parsed content is not a valid object:", analysisJson);
+           }
+
+    } catch (parseError: unknown) {
+        console.error("Failed to parse JSON string:", parseError);
+        console.error(`String attempted to parse (extracted: ${didExtract}):`, jsonStringToParse); // Log the string that failed + if extraction happened
         
-        if (!Array.isArray(structuredLayout)) {
-            console.error("Parsed analysis does not contain a valid 'structured_layout' array:", analysisJson);
-            structuredLayout = null; // Reset if invalid
-        } else {
-            console.log("Successfully extracted structured_layout:", structuredLayout);
-        }
-        // Optional: Add similar validation for executionPlan if you use it
+        // Type check before accessing properties
+        const errorMessage = parseError instanceof Error ? parseError.message : String(parseError);
         
-      } else {
-         console.error("Parsed analysis is not a valid object:", analysisJson);
-      }
-      
-    } catch (parseError) {
-      console.error("Failed to parse analysis string as JSON:", parseError);
-      console.error("Original analysis string:", analysisString);
-      // Decide how to handle the error, maybe return an error response or proceed without the layout
-      throw new Error("Failed to parse layout data from vision model response."); 
+        // Re-throw error to be caught by the main handler
+        throw new Error(`Failed to parse JSON response after processing: ${errorMessage}`);
     }
-    // --- END NEW ---
 
-    // --- NEW: Call Flask Validation API ---
-    let validationErrors: any[] = []; // Initialize as empty array
-    let validationStatus: string = "not_run"; // Track status
+    return { structuredLayout, executionPlan };
+}
 
-    if (structuredLayout && depthMapUrl && originalWidth && originalHeight) {
-      const validationApiUrl = process.env.VALIDATION_API_URL || 'http://localhost:5001/validate_layout'; // Use env var or default
+// Helper Function to Validate Layout
+async function validateLayoutWithApi(
+    layout: any[] | null,
+    depthMapUrl: string | null,
+    imageWidth: number,
+    imageHeight: number
+): Promise<{ validationStatus: string, validationErrors: any[] }> {
+    let validationErrors: any[] = [];
+    let validationStatus: string = "not_run";
+
+    if (layout && depthMapUrl && imageWidth && imageHeight) {
+      const validationApiUrl = process.env.VALIDATION_API_URL || 'http://localhost:5001/validate_layout';
       console.log(`Calling validation API at: ${validationApiUrl}`);
 
       try {
         const validationResponse = await fetch(validationApiUrl, {
           method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-          },
+          headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
-            layout: structuredLayout,
-            image_dimensions: { width: originalWidth, height: originalHeight },
-            depth_map_url: depthMapUrl, // Send the generated depth map URL
+            layout: layout,
+            image_dimensions: { width: imageWidth, height: imageHeight },
+            depth_map_url: depthMapUrl,
           }),
-          // Add a timeout (optional but recommended)
-          signal: AbortSignal.timeout(30000) // 30 seconds timeout
+          signal: AbortSignal.timeout(30000)
         });
 
         if (!validationResponse.ok) {
-          // Handle HTTP errors from Flask (e.g., 400, 500)
-          const errorBody = await validationResponse.text(); // Read error body as text first
+          const errorBody = await validationResponse.text();
           console.error(`Validation API returned error ${validationResponse.status}: ${errorBody}`);
           validationStatus = "api_error";
-          // Optionally, rethrow or add a generic error to validationErrors
-          // validationErrors.push({ check: "API", message: `Validation API failed with status ${validationResponse.status}`}); 
         } else {
           const validationResult = await validationResponse.json();
           if (validationResult.status === 'success') {
@@ -394,9 +366,9 @@ export async function POST(request: NextRequest) {
             console.log("Layout validation successful.");
           } else if (validationResult.status === 'error') {
             validationStatus = "failed";
-            validationErrors = validationResult.errors || []; // Ensure errors is an array
+            validationErrors = validationResult.errors || [];
             console.warn(`Layout validation failed with ${validationErrors.length} errors.`);
-            console.warn("Validation Errors:", JSON.stringify(validationErrors, null, 2)); 
+            console.warn("Validation Errors:", JSON.stringify(validationErrors, null, 2));
           } else {
              validationStatus = "unknown_response";
              console.error("Validation API returned unexpected status:", validationResult);
@@ -404,53 +376,166 @@ export async function POST(request: NextRequest) {
         }
       } catch (validationError) {
          validationStatus = "network_error";
+         // ... (error logging for network/timeout) ...
          if (validationError instanceof Error && validationError.name === 'TimeoutError') {
              console.error("Validation API call timed out:", validationError);
          } else {
             console.error("Error calling validation API:", validationError);
          }
-         // Optionally, add a generic error to validationErrors
-         // validationErrors.push({ check: "Network", message: "Failed to connect to validation API." });
       }
     } else {
         console.warn("Skipping validation API call due to missing data (layout, depth map, or dimensions).");
         validationStatus = "skipped";
     }
-    // --- END NEW ---
+    return { validationStatus, validationErrors };
+}
 
-    // Log all generated URLs and data
+export async function POST(request: NextRequest) {
+  let structuredLayout: any[] | null = null;
+  let executionPlan: any[] | null = null;
+  let validationStatus: string = "not_run";
+  let validationErrors: any[] = [];
+  let finalAnalysisString: string | null = null; // Store the string that produced the final layout
+
+  // Declare vars needed across attempts
+  let originalImageUrl: string | null = null;
+  let cannyMapUrl: string | null = null;
+  let depthMapUrl: string | null = null;
+  let furnishedImageUrl: string | null = null;
+  let furnitureList: string | null = null;
+  let groundingData: any = null;
+  let florenceResults: any = null;
+  let originalWidth: number = 0;
+  let originalHeight: number = 0;
+  let userPrompt: string = "";
+
+  try {
+    const formData = await request.formData();
+    const image = formData.get("image") as File;
+    userPrompt = (formData.get("prompt") || formData.get("text")) as string;
+    const model = (formData.get("model") || 'gemini') as 'gpt4o' | 'gemini'; // Default to gemini
+
+    if (!image || !userPrompt) {
+      const error = !image ? "No image provided" : "No prompt provided";
+      return NextResponse.json({ success: false, error }, { status: 400 });
+    }
+    console.log("Received prompt:", userPrompt);
+
+    // --- Initial Setup ---
+    const imageBuffer = Buffer.from(await image.arrayBuffer());
+    ({ width: originalWidth, height: originalHeight } = await getImageDimensions(imageBuffer));
+    console.log("Original image dimensions:", { width: originalWidth, height: originalHeight });
+    originalImageUrl = await fal.storage.upload(image);
+
+    // --- Generate Supporting Assets ---
+    [cannyMapUrl, depthMapUrl] = await Promise.all([
+      generateCannyMap(originalImageUrl, originalWidth, originalHeight),
+      generateDepthMap(originalImageUrl, originalWidth, originalHeight),
+    ]);
+    furnishedImageUrl = await generateFurnishedImage(originalImageUrl, userPrompt);
+    furnitureList = await getFurnitureListFromSA2VA(furnishedImageUrl);
+    groundingData = await getGroundingDataFromFlorence(furnishedImageUrl, furnitureList);
+    florenceResults = groundingData.results; // Assuming results exist
+
+    // --- Attempt 1: Call Gemini & Validate ---
+    console.log("\n--- Attempt 1: Generating Initial Layout ---");
+    let attempt1Prompt = prepareGeminiPrompt("", florenceResults, userPrompt, originalWidth, originalHeight);
+    finalAnalysisString = await analyzeImageWithGemini(
+        originalImageUrl, depthMapUrl, cannyMapUrl, furnishedImageUrl,
+        florenceResults, attempt1Prompt, // Pass prepared prompt string directly
+        originalWidth, originalHeight
+    );
+    ({ structuredLayout, executionPlan } = parseGeminiResponse(finalAnalysisString));
+
+    if (structuredLayout) {
+        ({ validationStatus, validationErrors } = await validateLayoutWithApi(
+            structuredLayout, depthMapUrl, originalWidth, originalHeight
+        ));
+    } else {
+        validationStatus = "parsing_failed"; // Indicate layout couldn't be parsed
+        console.error("Skipping validation because initial layout parsing failed.");
+    }
+
+    // --- Attempt 2 (Retry if needed) ---
+    if (validationStatus === 'failed' && validationErrors.length > 0) {
+        console.log("\n--- Attempt 2: Retrying Layout Generation with Validation Feedback ---");
+
+        // Format validation errors for the prompt
+        const validationFeedback = `
+ISSUE: The previously generated plan failed geometric validation.
+
+VALIDATION ERRORS:
+\`\`\`json
+${JSON.stringify(validationErrors, null, 2)}
+\`\`\`
+
+REQUEST: Please generate a **revised** \`structured_layout\` and \`execution_plan\` JSON. Specifically **address the VALIDATION ERRORS listed above** by adjusting the \`bounding_box\` and/or \`spatial_anchor\` for the failed objects. **Pay close attention to the depth values indicated in the error messages relative to the expected plane ranges** to ensure realistic placement within the empty room's geometry (depth/canny maps) and resolve collisions. Adhere to all original requirements and guardrails. Ensure the output is ONLY the raw JSON.
+`;
+        // Prepare and call Gemini again
+        let attempt2Prompt = prepareGeminiPrompt(validationFeedback, florenceResults, userPrompt, originalWidth, originalHeight);
+        finalAnalysisString = await analyzeImageWithGemini( // Overwrite with retry result
+            originalImageUrl, depthMapUrl, cannyMapUrl, furnishedImageUrl,
+            florenceResults, attempt2Prompt, // Pass prepared prompt string directly
+            originalWidth, originalHeight
+        );
+        // Parse the *new* response
+        const { structuredLayout: layoutRetry, executionPlan: planRetry } = parseGeminiResponse(finalAnalysisString);
+
+        // Validate the *new* layout
+        if (layoutRetry) {
+             // Update main variables with retry results BEFORE validation
+             structuredLayout = layoutRetry;
+             executionPlan = planRetry;
+             // Validate the retry layout
+            ({ validationStatus, validationErrors } = await validateLayoutWithApi(
+                structuredLayout, depthMapUrl, originalWidth, originalHeight
+            ));
+             console.log(`Retry validation status: ${validationStatus}`);
+        } else {
+            validationStatus = "retry_parsing_failed"; // Indicate retry layout couldn't be parsed
+            console.error("Skipping validation because retry layout parsing failed.");
+            // Keep the results from the first attempt in this case? Or clear them?
+            // Let's keep the first attempt's layout/plan but mark validation as failed.
+            validationStatus = 'failed'; // Revert status as retry parse failed
+            // Errors from first validation are already stored in validationErrors
+        }
+    }
+
+    // --- Final Logging and Response ---
+    console.log("\n--- Final Results ---");
     console.log({
       originalImage: originalImageUrl,
       cannyMap: cannyMapUrl,
       depthMap: depthMapUrl,
       furnishedImage: furnishedImageUrl,
       furnitureList: furnitureList,
-      groundingData: groundingData,
-      structuredLayout: structuredLayout, 
-      executionPlan: executionPlan,     
-      validationStatus: validationStatus, // Log validation status
-      validationErrors: validationErrors  // Log validation errors
+      groundingData: groundingData, // Maybe exclude large data from final log?
+      structuredLayout: structuredLayout, // Final layout (either from attempt 1 or 2)
+      executionPlan: executionPlan,     // Final plan (either from attempt 1 or 2)
+      validationStatus: validationStatus, // Final validation status
+      validationErrors: validationErrors  // Final validation errors (from last attempt)
+      // finalAnalysisString: finalAnalysisString // Optional: log the raw string
     });
 
-    // --- UPDATE RESPONSE: Include validation results ---
-    return NextResponse.json({ 
-      success: true, 
-      message: "Images processed, analyzed, and validated successfully", // Updated message
+    return NextResponse.json({
+      success: true, // API call itself succeeded, check validationStatus in data
+      message: `Processing completed. Validation status: ${validationStatus}`,
       data: {
           originalImageUrl,
           cannyMapUrl,
           depthMapUrl,
           furnishedImageUrl,
-          furnitureList,
-          groundingData,
-          structuredLayout, 
+          // furnitureList, // Maybe omit from response?
+          // groundingData, // Maybe omit from response?
+          structuredLayout,
           executionPlan,
-          validationStatus, // Include validation status
-          validationErrors  // Include validation errors
+          validationStatus,
+          validationErrors
       }
     });
+
   } catch (error) {
-    console.error("Error in generateImage:", error);
+    console.error("Error in generateImage main handler:", error);
     const errorMessage = error instanceof Error ? error.message : "Unknown error";
     return NextResponse.json(
       { success: false, error: `Failed to process request: ${errorMessage}` },

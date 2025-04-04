@@ -23,8 +23,8 @@ export async function analyzeImageWithGemini(
   cannyUrl: string, 
   furnishedImageUrl: string,
   florenceResults: any,
-  userPrompt: string, 
-  imageWidth: number, 
+  preparedPrompt: string,
+  imageWidth: number,
   imageHeight: number
 ) {
   try {
@@ -38,22 +38,15 @@ export async function analyzeImageWithGemini(
       imageUrlToBase64(furnishedImageUrl),
     ]);
 
-    // Read and prepare the prompt template
-    const promptTemplate = fs.readFileSync('src/app/utils/goated-gemini-prompt.txt', 'utf8');
-    const filledPrompt = promptTemplate
-        .replace('[PLACEHOLDER FOR IMAGE_DIMENSIONS]', `${imageWidth}x${imageHeight}`)
-        .replace('[PLACEHOLDER FOR USER_STYLE_PROMPT]', userPrompt)
-        .replace('[PLACEHOLDER FOR FLORENCE_JSON]', JSON.stringify(florenceResults));
-
     // Following documentation best practice: put images first for better results
     const contents = [
         // Images first
-        { inlineData: { data: image1, mimeType: "image/jpeg" } },          // Image A: Original empty interior        // Image C: Hallucinated furnished interior
-        { inlineData: { data: image2, mimeType: "image/jpeg" } },          // Image B: Depth (non-gridded)
-        { inlineData: { data: image3, mimeType: "image/jpeg" } },          // Image C: Canny (non-gridded)
-        { inlineData: { data: image4, mimeType: "image/jpeg" } },          // Image D: Furnished image
+        { inlineData: { data: image1, mimeType: "image/jpeg" } },          // Image A: Original empty interior
+        { inlineData: { data: image2, mimeType: "image/png" } },          // Image B: Depth (assuming PNG now)
+        { inlineData: { data: image3, mimeType: "image/jpeg" } },          // Image C: Canny
+        { inlineData: { data: image4, mimeType: "image/jpeg" } },          // Image D: Furnished image / Hallucination
         // Text prompt last
-        { text: filledPrompt }
+        { text: preparedPrompt }
     ];
 
     // Generate content and handle response
@@ -63,14 +56,14 @@ export async function analyzeImageWithGemini(
     });
 
     if (!result.candidates?.[0]?.content?.parts?.[0]?.text) {
+      console.error("Invalid response structure from Gemini:", JSON.stringify(result, null, 2));
       throw new Error("No valid text response received from Gemini");
     }
     
     const text = result.candidates[0].content.parts[0].text;
 
     if (process.env.NODE_ENV === 'development') {
-      console.log("Filled Prompt:", filledPrompt);
-      console.log("Gemini Response:", text);
+      console.log("Gemini Raw Text Response:", text);
     }
 
     return text;

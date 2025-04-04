@@ -6,6 +6,8 @@ TASK: Analyze a **hallucinated** furnished image (`hallucination.png`) and its o
 
 **ABSOLUTE PRIMARY OBJECTIVE:** The final plan MUST ensure that during generation (using the `execution_plan`), the original room's architectural geometry (`input_empty.png` structure) is perfectly preserved via ControlNet guidance specified in the plan. **Geometric accuracy relative to the empty room overrides fidelity to the hallucination.**
 
+[VALIDATION_FEEDBACK_SECTION]
+
 INPUTS PROVIDED (Assume these are accessible via specified names/paths):
 1.  `input_empty.png`: The original empty room photograph (Ground Truth Visual Context).
 2.  `control_depth.png`: Pre-generated depth map of the **empty room** (Ground Truth Geometric Structure). Use this to determine valid surfaces and relative depths.
