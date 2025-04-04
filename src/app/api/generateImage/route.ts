@@ -589,10 +589,12 @@ export async function POST(request: NextRequest) {
 
     // --- Generate Supporting Assets (Done once) ---
     console.log("\n--- Generating Supporting Assets ---");
+    if (!originalImageUrl) throw new Error("Original image URL is null after upload."); // Add null check
     [cannyMapUrl, depthMapUrl] = await Promise.all([
       generateCannyMap(originalImageUrl!, originalWidth, originalHeight),
       generateDepthMap(originalImageUrl!, originalWidth, originalHeight),
     ]);
+    if (!cannyMapUrl || !depthMapUrl) throw new Error("Failed to generate Canny or Depth map URL."); // Add null checks
     furnishedImageUrl = await generateFurnishedImage(originalImageUrl!, userPrompt);
     furnitureList = await getFurnitureListFromSA2VA(furnishedImageUrl!);
     groundingData = await getGroundingDataFromFlorence(furnishedImageUrl!, furnitureList!);
@@ -704,7 +706,7 @@ export async function POST(request: NextRequest) {
                 bestAttempt = attemptsWithData[attemptsWithData.length - 1];
                  console.warn(`Selected best attempt: #${bestAttempt.attemptNumber} (Failed early: ${bestAttempt.validationStatus}). Layout/Plan might be missing or invalid.`);
              } else {
-                 bestAttempt = attemptResults[attemptResults.length - 1];
+             bestAttempt = attemptResults[attemptResults.length - 1];
                  console.error(`Selected best attempt: #${bestAttempt?.attemptNumber}. Failed very early: ${bestAttempt?.validationStatus}. No layout or plan available.`);
              }
          }
@@ -767,28 +769,23 @@ export async function POST(request: NextRequest) {
      } else {
          console.error("Cannot create combined execution plan: Final layout or plan is missing/empty.");
          return NextResponse.json(
-           { 
-                success: false, 
+           {
+                success: false,
                 error: "Could not proceed: Missing valid layout or plan."
-           }, 
+                // Removed problematic details spread syntax
+           },
            { status: 500 }
        );
      }
 
      // --- START MASK GENERATION AND EXECUTION LOOP ---
      console.log("\n--- Starting Mask Generation & Execution Loop ---");
-     let finalGeneratedImageUrl: string | null = originalImageUrl; 
+     let currentImageUrl = originalImageUrl; // Initialize with the empty room URL
+     let finalGeneratedImageUrl: string | null = originalImageUrl; // Track final result
 
-     // --- Ensure local mask directory exists ---
-     const localMaskDir = path.join(process.cwd(), 'public', 'generated_masks');
-     try {
-         await fsPromises.mkdir(localMaskDir, { recursive: true });
-         console.log(`Ensured local mask directory exists: ${localMaskDir}`);
-     } catch (dirError) {
-         console.error(`Failed to create local mask directory ${localMaskDir}:`, dirError);
-         // Decide if this is fatal or just prevents local saving
-         // return NextResponse.json({ success: false, error: "Failed to create mask directory" }, { status: 500 });
-     }
+     // REMOVED: Local mask directory creation logic
+     // const localMaskDir = path.join(process.cwd(), 'public', 'generated_masks');
+     // try { ... } catch { ... }
      // -----------------------------------------
 
      for (let i = 0; i < combinedExecutionPlan.length; i++) {
@@ -827,23 +824,17 @@ export async function POST(request: NextRequest) {
                  throw new Error(`Mask generation API did not return success or mask_b64: ${JSON.stringify(maskResult)}`);
              }
 
-             console.log(`Step ${combinedStep.step}: Received mask base64, uploading to storage...`);
+             console.log(`Step ${combinedStep.step}: Received mask base64, decoding...`);
              const maskBuffer = Buffer.from(maskResult.mask_b64, 'base64');
              const maskFileName = `mask_step_${combinedStep.step}.png`;
 
-             // --- Save mask locally --- 
-             const localMaskPath = path.join(localMaskDir, maskFileName);
-             try {
-                 await fsPromises.writeFile(localMaskPath, maskBuffer);
-                 console.log(`Step ${combinedStep.step}: Mask saved locally to ${localMaskPath}`);
-             } catch (saveError) {
-                 console.error(`Step ${combinedStep.step}: Failed to save mask locally to ${localMaskPath}:`, saveError);
-                 // Non-fatal, just log the error and continue with upload
-             }
+             // REMOVED: Local mask saving logic
+             // const localMaskPath = path.join(localMaskDir, maskFileName);
+             // try { ... } catch { ... }
              // ------------------------
 
+             console.log(`Step ${combinedStep.step}: Uploading mask to storage...`);
              const maskFile = new File([maskBuffer], maskFileName, { type: 'image/png' });
-
              maskUrlForStep = await fal.storage.upload(maskFile);
              console.log(`Step ${combinedStep.step}: Mask uploaded successfully: ${maskUrlForStep}`);
 
@@ -857,8 +848,108 @@ export async function POST(request: NextRequest) {
              );
          }
 
+         // --- Call Flux Inpainting ---
          if (maskUrlForStep) {
-              console.log(`Step ${combinedStep.step}: Mask URL ${maskUrlForStep} ready for inpainting.`);
+              console.log(`Step ${combinedStep.step}: Mask URL ${maskUrlForStep} ready. Calling Flux Inpainting...`);
+
+              try {
+                 // Define static parameters for Flux
+                 const fluxParams = {
+                     num_inference_steps: 28,
+                     guidance_scale: 3.5,
+                     real_cfg_scale: 3.5,
+                     strength: 0.85, // Inpainting strength
+                     num_images: 1,
+                     enable_safety_checker: true,
+                     reference_strength: 0.65,
+                     reference_end: 1,
+                     base_shift: 0.5,
+                     max_shift: 1.15,
+                     // controlnets and ip_adapters are typically empty unless specifically needed for inpaint style
+                     controlnets: [],
+                     ip_adapters: [],
+                 };
+
+                 // Prepare controlnet_unions payload according to the corrected schema
+                 let fluxControlnetUnions: any[] = [];
+                 const cnUnionDef = combinedStep.controlnet_unions?.[0]; // Get the union definition object from Gemini plan
+
+                 // We need the path, depth URL, canny URL, and the scales from the definition
+                 if (cnUnionDef && cnUnionDef.path && depthMapUrl && cannyMapUrl &&
+                     Array.isArray(cnUnionDef.conditioning_scale) && cnUnionDef.conditioning_scale.length >= 2)
+                 {
+                      // Assume the first scale corresponds to depth, second to canny
+                      const depthScale = cnUnionDef.conditioning_scale[0];
+                      const cannyScale = cnUnionDef.conditioning_scale[1];
+
+                      fluxControlnetUnions = [
+                          {
+                              path: cnUnionDef.path,
+                              controls: [
+                                  { // Depth Control Object
+                                      control_image_url: depthMapUrl, // Direct URL string
+                                      control_mode: "depth",          // String mode
+                                      conditioning_scale: depthScale  // Corresponding scale
+                                  },
+                                  { // Canny Control Object
+                                      control_image_url: cannyMapUrl, // Direct URL string
+                                      control_mode: "canny",          // String mode
+                                      conditioning_scale: cannyScale  // Corresponding scale
+                                  }
+                              ]
+                          }
+                      ];
+                      console.log(`Step ${combinedStep.step}: Configured ControlNet Union with Depth & Canny.`);
+                 } else {
+                      console.warn(`Step ${combinedStep.step}: ControlNet Union definition missing or incomplete in execution plan. Proceeding without ControlNets.`);
+                      console.warn("Definition received:", JSON.stringify(cnUnionDef));
+                      console.warn("Needed URLs:", { depthMapUrl, cannyMapUrl });
+                      fluxControlnetUnions = []; // Ensure it's an empty array if not configured
+                 }
+
+                 // Construct the full input payload
+                 const fluxInput = {
+                     image_url: currentImageUrl, // Use the output from the previous step
+                     mask_url: maskUrlForStep,
+                     prompt: combinedStep.prompt, // Use the step-specific prompt
+                     // controlnet_unions: fluxControlnetUnions, // Temporarily commented out
+                     ...fluxParams // Spread the static parameters (ensure 'controlnets' is removed from fluxParams)
+                 };
+
+                 console.log(`Step ${combinedStep.step}: Flux Input Payload:`, JSON.stringify(fluxInput, null, 2)); // Log payload for debugging
+
+                 // Call Fal.ai Flux Inpainting
+                 const fluxResult = await fal.subscribe("fal-ai/flux-general/inpainting", {
+                     input: fluxInput,
+                     logs: true,
+                     onQueueUpdate: (update) => {
+                         if (update.status === "IN_PROGRESS") {
+                             update.logs.map((log) => log.message).forEach(msg => console.log(`[Flux Step ${combinedStep.step}]: ${msg}`));
+                         }
+                     },
+                 });
+
+                 // Process the result
+                 const newImageUrl = (fluxResult?.data as any)?.images?.[0]?.url;
+                 if (typeof newImageUrl !== 'string' || !newImageUrl) {
+                     console.error("Flux response structure:", JSON.stringify(fluxResult, null, 2));
+                     throw new Error("Inpainted image URL not found or invalid in Flux response");
+                 }
+
+                 console.log(`Step ${combinedStep.step}: Inpainting successful. New image URL: ${newImageUrl}`);
+
+                 // Update currentImageUrl for the next iteration
+                 currentImageUrl = newImageUrl;
+                 finalGeneratedImageUrl = newImageUrl; // Update the final image tracker
+
+              } catch (fluxError) {
+                   console.error(`Step ${combinedStep.step}: Failed during Flux inpainting call:`, fluxError);
+                   return NextResponse.json(
+                       { success: false, error: `Failed during inpainting for step ${combinedStep.step}: ${fluxError instanceof Error ? fluxError.message : String(fluxError)}` },
+                       { status: 500 }
+                   );
+              }
+
          } else {
               console.error(`Step ${combinedStep.step}: Mask URL is null, cannot proceed with inpainting.`);
                return NextResponse.json(
@@ -866,38 +957,41 @@ export async function POST(request: NextRequest) {
                   { status: 500 }
               );
          }
+         // --- End Flux Call ---
 
-     }
+     } // End of execution loop
 
      console.log("\n--- Mask Generation & Execution Loop Finished ---");
 
 
     // --- Final Logging and Response ---
-    console.log("\n--- Final Results (After Mask Generation Attempt) ---");
+    console.log("\n--- Final Results (After Inpainting) ---");
     console.log({
-        selectedAttemptNumber: bestAttempt?.attemptNumber,
-        finalValidationStatus: bestAttempt?.validationStatus,
-        finalValidationErrorCount: bestAttempt?.errorCount,
-        originalImage: originalImageUrl,
-        cannyMap: cannyMapUrl,
-        depthMap: depthMapUrl,
+      selectedAttemptNumber: bestAttempt?.attemptNumber,
+      finalValidationStatus: bestAttempt?.validationStatus,
+      finalValidationErrorCount: bestAttempt?.errorCount,
+      originalImage: originalImageUrl,
+      cannyMap: cannyMapUrl,
+      depthMap: depthMapUrl,
+        // Log the plan *with generated mask URLs*
         combinedExecutionPlanWithMasks: combinedExecutionPlan,
-        finalGeneratedImageUrl: finalGeneratedImageUrl,
-        generatedFeedbacks: generatedFeedbacks
+        finalGeneratedImageUrl: finalGeneratedImageUrl, // Show the final image URL
+      generatedFeedbacks: generatedFeedbacks
     });
 
 
     // Return data needed for potential client-side display or next steps
     return NextResponse.json({
       success: true,
-      message: `Processing completed. Best attempt: #${bestAttempt?.attemptNumber ?? 'N/A'}. Masks generated for ${combinedExecutionPlan.filter(s => s.generatedMaskUrl).length} steps.`,
+      message: `Processing completed. Best attempt: #${bestAttempt?.attemptNumber ?? 'N/A'}. Inpainting finished. Final image URL: ${finalGeneratedImageUrl}`,
       data: {
         originalImageUrl,
         cannyMapUrl,
         depthMapUrl,
         imageDimensions,
+        // Include the plan with generated mask URLs
         combinedExecutionPlan: combinedExecutionPlan,
-        finalGeneratedImageUrl: finalGeneratedImageUrl,
+        finalGeneratedImageUrl: finalGeneratedImageUrl, // The final output after all steps
         validationStatus: bestAttempt?.validationStatus ?? 'no_valid_attempt',
         validationErrors: bestAttempt?.validationErrors ?? [],
         attemptNumberSelected: bestAttempt?.attemptNumber
