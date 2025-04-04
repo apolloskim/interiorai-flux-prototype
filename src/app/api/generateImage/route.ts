@@ -17,6 +17,25 @@ const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
 
+// --- Interfaces ---
+interface ValidationError {
+  object: string;
+  check: 'Bounds' | 'SpatialAnchor' | 'Overlap' | 'DataError' | 'Setup';
+  message: string;
+  relatedObject?: string;
+}
+
+// NEW Interface for storing attempt results
+interface AttemptResult {
+  attemptNumber: number;
+  structuredLayout: any[] | null; // Use specific type if available
+  executionPlan: any[] | null; // Use specific type if available
+  validationStatus: string; // Keep as string to handle various statuses
+  validationErrors: ValidationError[] | null;
+  errorCount: number;
+  analysisString: string | null; // Store the raw analysis string for this attempt
+}
+
 async function getImageDimensions(buffer: Buffer): Promise<{ width: number; height: number }> {
   const metadata = await sharp(buffer).metadata();
   if (!metadata.width || !metadata.height) {
@@ -220,32 +239,6 @@ async function getGroundingDataFromFlorence(imageUrl: string, furnitureList: str
   }
 }
 
-// Replace the existing analyzeImageWithVision function with a new one that supports both models
-async function analyzeImageWithVision(
-  imageUrl: string,
-  depthUrl: string,
-  cannyUrl: string,
-  furnishedImageUrl: string,
-  florenceResults: any,
-  userPrompt: string,
-  imageWidth: number,
-  imageHeight: number,
-  model: 'gpt4o' | 'gemini' = 'gemini' // Default to Gemini
-) {
-  if (model === 'gemini') {
-    return analyzeImageWithGemini(
-      imageUrl,
-      depthUrl,
-      cannyUrl,
-      furnishedImageUrl,
-      florenceResults,
-      userPrompt,
-      imageWidth,
-      imageHeight
-    );
-  }
-}
-
 // Helper Function to Prepare Gemini Prompt
 function prepareGeminiPrompt(
     validationFeedback: string, // Pass errors as a formatted string or empty string
@@ -390,14 +383,142 @@ async function validateLayoutWithApi(
     return { validationStatus, validationErrors };
 }
 
+// --- Add Helper Function ---
+/**
+ * Generates the validation feedback section for re-prompting the LLM.
+ * Uses qualitative instructions for anchor errors.
+ * @param validationErrors - The array of error objects from the validator API.
+ * @param depthConventionHighIsClose - Set based on depth map (false for Marigold).
+ * @returns The formatted feedback string section, or null if no errors.
+ */
+function generateRepromptFeedback(
+    validationErrors: ValidationError[] | null | undefined,
+    depthConventionHighIsClose: boolean = false // Default to Marigold (Low=Close)
+): string | null {
+  if (!validationErrors || validationErrors.length === 0) {
+    return null; // No errors, no feedback needed
+  }
+
+  const feedback_instructions: string[] = [];
+  const objects_to_revise: Set<string> = new Set();
+
+  // Regex to try and extract depth values for context, even if not used in instruction
+  const anchorRegex = /Object Img Depth \((\d+(\.\d+)?)\) outside Plane Z Range \[(-?\d+(\.\d+)?)-(\d+(\.\d+)?)\].*/;
+
+  for (const error of validationErrors) {
+    const obj_name = error.object;
+    objects_to_revise.add(obj_name);
+    if (error.relatedObject) {
+      objects_to_revise.add(error.relatedObject);
+    }
+
+    let instruction: string | null = null;
+    const check_type = error.check;
+    const message = error.message || "";
+
+    try {
+      if (check_type === "SpatialAnchor") {
+        const anchor = message.split("'")[1] || 'unknown'; // Extract anchor type simply
+        const match = message.match(anchorRegex);
+        let direction = "Incorrect depth placement"; // Default direction
+
+        if (match) {
+          const obj_depth = parseFloat(match[1]);
+          const expected_min = parseFloat(match[3]);
+          const expected_max = parseFloat(match[5]);
+
+          // Determine direction based on specified convention
+          if (depthConventionHighIsClose) { // High = Close
+            if (obj_depth > expected_max) direction = "FARTHER (higher depth value)";
+            else if (obj_depth < expected_min) direction = "CLOSER (lower depth value)";
+          } else { // Low = Close (Marigold)
+            if (obj_depth > expected_max) direction = "FARTHER (higher depth value)";
+            else if (obj_depth < expected_min) direction = "CLOSER (lower depth value)";
+          }
+
+          // --- Generate Qualitative Instruction ---
+          if (anchor === 'ceiling') {
+              if (direction.includes("FARTHER")) {
+                  instruction = `Place '${obj_name}' (anchor 'ceiling') **much higher (significantly smaller Y coordinates)**. It is currently placed too low/far from the main ceiling plane.`;
+              } else { // Placed too close (unlikely for pendants, but possible)
+                   instruction = `Place '${obj_name}' (anchor 'ceiling') **slightly lower (slightly larger Y coordinates)**. It is currently placed too high/close to the main ceiling plane.`;
+              }
+          } else if (anchor === 'wall') {
+              if (direction.includes("FARTHER")) {
+                   instruction = `Place '${obj_name}' (anchor 'wall') **significantly closer (lower depth value)**. It is currently placed too far back compared to the main wall plane it should be on. Check X/Y placement.`;
+              } else { // Placed too close
+                   instruction = `Place '${obj_name}' (anchor 'wall') **significantly farther back (higher depth value)**. It is currently placed too close compared to the main wall plane it should be on. Check X/Y placement.`;
+              }
+          } else if (anchor === 'floor') {
+              if (direction.includes("FARTHER")) {
+                   instruction = `Place '${obj_name}' (anchor 'floor') **closer (lower depth value)**. It is currently placed too far back compared to the expected floor plane depth in its area. Adjust Y coordinate.`;
+              } else { // Placed too close
+                   instruction = `Place '${obj_name}' (anchor 'floor') **farther back (higher depth value)**. It is currently placed too close compared to the expected floor plane depth in its area. Adjust Y coordinate.`;
+              }
+          } else {
+               instruction = `Re-evaluate placement for '${obj_name}' (anchor '${anchor}'). Failed depth consistency check. Direction: ${direction}.`;
+          }
+
+        } else {
+           // Fallback if regex fails
+            const anchorName = error.object || 'unknown_object'; 
+           instruction = `Revise placement depth for '${obj_name}' (anchor '${anchorName}') - failed depth consistency check. Message: ${message}`;
+        }
+
+      } else if (check_type === "Overlap") {
+         const relatedObjName = error.relatedObject || 'another_object';
+        instruction = `Resolve collision risk between '${obj_name}' and '${relatedObjName}'. Increase separation between their bounding boxes while maintaining realistic placement.`;
+      } else if (check_type === "Bounds") {
+         const dimsMatch = message.match(/\((\d+)x(\d+)\)/);
+         const dims = dimsMatch ? `(${dimsMatch[1]}x${dimsMatch[2]})` : '';
+         instruction = `Correct bounding box for '${obj_name}'; it extends outside image dimensions ${dims}. Ensure coordinates [xmin, ymin, xmax, ymax] are within bounds.`;
+      } else if (check_type === "DataError") {
+          instruction = `Correct data format for '${obj_name}'. Error: ${message}`;
+      } else if (check_type === "Setup") {
+           console.error(`Setup/System Error: ${message}`);
+           instruction = null;
+      } else {
+           instruction = `Address issue for '${obj_name}'. Check: ${check_type}, Message: ${message}`;
+      }
+    } catch (parseError: unknown) {
+         const errorMsg = parseError instanceof Error ? parseError.message : String(parseError);
+        console.error(`Error parsing validation message for ${obj_name}: ${message}`, errorMsg);
+        instruction = `Address validation failure for '${obj_name}'. Check: ${check_type}. Message: ${message}`;
+    }
+
+    if (instruction) {
+      feedback_instructions.push(instruction);
+    }
+  }
+
+  // --- Construct feedback section (Same as before) ---
+  if (feedback_instructions.length === 0) { return null; }
+  const feedbackSection = `
+ISSUE: The previously generated plan failed geometric validation.
+
+VALIDATION ERRORS:
+\`\`\`json
+${JSON.stringify(validationErrors, null, 2)}
+\`\`\`
+
+REQUEST: Please generate a **revised** \`structured_layout\` and \`execution_plan\` JSON. Specifically address the VALIDATION ERRORS by revising the objects: ${JSON.stringify(Array.from(objects_to_revise).sort())}. Follow these specific instructions derived from the errors:
+${feedback_instructions.map(inst => `- ${inst}`).join('\n')}
+Adhere to all original requirements and guardrails. Ensure the output is ONLY the raw JSON.
+`;
+  return feedbackSection;
+}
+
+// --- MAIN POST FUNCTION (Modify loop inside) ---
 export async function POST(request: NextRequest) {
+  // Variables to hold the results across attempts
   let structuredLayout: any[] | null = null;
   let executionPlan: any[] | null = null;
   let validationStatus: string = "not_run";
   let validationErrors: any[] = [];
   let finalAnalysisString: string | null = null; // Store the string that produced the final layout
+  let generatedFeedbacks: string[] = []; // <<< NEW: Array to store feedback strings
 
-  // Declare vars needed across attempts
+  // Variables for data generated once
   let originalImageUrl: string | null = null;
   let cannyMapUrl: string | null = null;
   let depthMapUrl: string | null = null;
@@ -408,12 +529,19 @@ export async function POST(request: NextRequest) {
   let originalWidth: number = 0;
   let originalHeight: number = 0;
   let userPrompt: string = "";
+  let model: 'gpt4o' | 'gemini' = 'gemini'; // Default or from request
+
+  // NEW: Store results of each attempt
+  let attemptResults: AttemptResult[] = [];
+
+  const maxAttempts = 3;
 
   try {
+    // --- Initial Setup ---
     const formData = await request.formData();
     const image = formData.get("image") as File;
     userPrompt = (formData.get("prompt") || formData.get("text")) as string;
-    const model = (formData.get("model") || 'gemini') as 'gpt4o' | 'gemini'; // Default to gemini
+    model = (formData.get("model") || 'gemini') as 'gpt4o' | 'gemini';
 
     if (!image || !userPrompt) {
       const error = !image ? "No image provided" : "No prompt provided";
@@ -421,116 +549,199 @@ export async function POST(request: NextRequest) {
     }
     console.log("Received prompt:", userPrompt);
 
-    // --- Initial Setup ---
     const imageBuffer = Buffer.from(await image.arrayBuffer());
     ({ width: originalWidth, height: originalHeight } = await getImageDimensions(imageBuffer));
     console.log("Original image dimensions:", { width: originalWidth, height: originalHeight });
     originalImageUrl = await fal.storage.upload(image);
 
-    // --- Generate Supporting Assets ---
+    // --- Generate Supporting Assets (Done once) ---
+    console.log("\n--- Generating Supporting Assets ---");
     [cannyMapUrl, depthMapUrl] = await Promise.all([
-      generateCannyMap(originalImageUrl, originalWidth, originalHeight),
-      generateDepthMap(originalImageUrl, originalWidth, originalHeight),
+      generateCannyMap(originalImageUrl!, originalWidth, originalHeight),
+      generateDepthMap(originalImageUrl!, originalWidth, originalHeight),
     ]);
-    furnishedImageUrl = await generateFurnishedImage(originalImageUrl, userPrompt);
-    furnitureList = await getFurnitureListFromSA2VA(furnishedImageUrl);
-    groundingData = await getGroundingDataFromFlorence(furnishedImageUrl, furnitureList);
+    furnishedImageUrl = await generateFurnishedImage(originalImageUrl!, userPrompt);
+    furnitureList = await getFurnitureListFromSA2VA(furnishedImageUrl!);
+    groundingData = await getGroundingDataFromFlorence(furnishedImageUrl!, furnitureList!);
     florenceResults = groundingData.results; // Assuming results exist
+    console.log("--- Supporting Assets Generated ---");
 
-    // --- Attempt 1: Call Gemini & Validate ---
-    console.log("\n--- Attempt 1: Generating Initial Layout ---");
-    let attempt1Prompt = prepareGeminiPrompt("", florenceResults, userPrompt, originalWidth, originalHeight);
-    finalAnalysisString = await analyzeImageWithGemini(
-        originalImageUrl, depthMapUrl, cannyMapUrl, furnishedImageUrl,
-        florenceResults, attempt1Prompt, // Pass prepared prompt string directly
-        originalWidth, originalHeight
-    );
-    ({ structuredLayout, executionPlan } = parseGeminiResponse(finalAnalysisString));
+    // --- Loop for Generation and Validation ---
+    let currentValidationFeedback = ""; // Feedback for the *next* prompt
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      console.log(`\n--- Attempt ${attempt} of ${maxAttempts}: Layout Generation ---`);
 
-    if (structuredLayout) {
-        ({ validationStatus, validationErrors } = await validateLayoutWithApi(
-            structuredLayout, depthMapUrl, originalWidth, originalHeight
-        ));
-    } else {
-        validationStatus = "parsing_failed"; // Indicate layout couldn't be parsed
-        console.error("Skipping validation because initial layout parsing failed.");
-    }
+      // Vars for this specific attempt's results
+      let currentAnalysisString: string | null = null;
+      let currentLayout: any[] | null = null;
+      let currentPlan: any[] | null = null;
+      let currentValidationStatus: string = "not_run";
+      let currentValidationErrors: ValidationError[] = [];
 
-    // --- Attempt 2 (Retry if needed) ---
-    if (validationStatus === 'failed' && validationErrors.length > 0) {
-        console.log("\n--- Attempt 2: Retrying Layout Generation with Validation Feedback ---");
+      // 1. Prepare Prompt
+      let currentPrompt = prepareGeminiPrompt(
+        currentValidationFeedback, // Use feedback from *previous* attempt
+        florenceResults!,
+        userPrompt,
+        originalWidth,
+        originalHeight
+      );
 
-        // Format validation errors for the prompt
-        const validationFeedback = `
-ISSUE: The previously generated plan failed geometric validation.
-
-VALIDATION ERRORS:
-\`\`\`json
-${JSON.stringify(validationErrors, null, 2)}
-\`\`\`
-
-REQUEST: Please generate a **revised** \`structured_layout\` and \`execution_plan\` JSON. Specifically **address the VALIDATION ERRORS listed above** by adjusting the \`bounding_box\` and/or \`spatial_anchor\` for the failed objects. **Pay close attention to the depth values indicated in the error messages relative to the expected plane ranges** to ensure realistic placement within the empty room's geometry (depth/canny maps) and resolve collisions. Adhere to all original requirements and guardrails. Ensure the output is ONLY the raw JSON.
-`;
-        // Prepare and call Gemini again
-        let attempt2Prompt = prepareGeminiPrompt(validationFeedback, florenceResults, userPrompt, originalWidth, originalHeight);
-        finalAnalysisString = await analyzeImageWithGemini( // Overwrite with retry result
-            originalImageUrl, depthMapUrl, cannyMapUrl, furnishedImageUrl,
-            florenceResults, attempt2Prompt, // Pass prepared prompt string directly
-            originalWidth, originalHeight
+      // 2. Call Gemini
+      try {
+        currentAnalysisString = await analyzeImageWithGemini(
+          originalImageUrl!, depthMapUrl!, cannyMapUrl!, furnishedImageUrl!,
+          florenceResults!, currentPrompt,
+          originalWidth, originalHeight
         );
-        // Parse the *new* response
-        const { structuredLayout: layoutRetry, executionPlan: planRetry } = parseGeminiResponse(finalAnalysisString);
+      } catch (geminiError: any) {
+        console.error(`Attempt ${attempt}: Error calling Gemini - ${geminiError.message}`);
+        currentValidationStatus = `attempt_${attempt}_gemini_error`;
+        // Store this failed attempt result
+        attemptResults.push({
+            attemptNumber: attempt,
+            structuredLayout: null,
+            executionPlan: null,
+            validationStatus: currentValidationStatus,
+            validationErrors: [],
+            errorCount: 999, // Assign high error count on Gemini failure
+            analysisString: null,
+        });
+        if (attempt === maxAttempts) break;
+        continue; // Try next attempt
+      }
 
-        // Validate the *new* layout
-        if (layoutRetry) {
-             // Update main variables with retry results BEFORE validation
-             structuredLayout = layoutRetry;
-             executionPlan = planRetry;
-             // Validate the retry layout
-            ({ validationStatus, validationErrors } = await validateLayoutWithApi(
-                structuredLayout, depthMapUrl, originalWidth, originalHeight
-            ));
-             console.log(`Retry validation status: ${validationStatus}`);
+      // 3. Parse Response
+      try {
+           ({ structuredLayout: currentLayout, executionPlan: currentPlan } = parseGeminiResponse(currentAnalysisString));
+           if (!currentLayout || !currentPlan) {
+                throw new Error("Parsing failed or returned null layout/plan.");
+           }
+      } catch (parseError: any) {
+          console.error(`Attempt ${attempt}: Parsing failed - ${parseError.message}`);
+          currentValidationStatus = `attempt_${attempt}_parsing_failed`;
+           // Store this failed attempt result
+           attemptResults.push({
+                attemptNumber: attempt,
+                structuredLayout: null, // Parsed layout is null
+                executionPlan: null, // Parsed plan is null
+                validationStatus: currentValidationStatus,
+                validationErrors: [],
+                errorCount: 998, // Assign high error count on parse failure
+                analysisString: currentAnalysisString, // Store the string that failed
+           });
+          if (attempt === maxAttempts) break;
+          continue; // Try next attempt
+      }
+
+      // 4. Validate Layout
+      console.log(`--- Attempt ${attempt}: Validating Layout ---`);
+      ({ validationStatus: currentValidationStatus, validationErrors: currentValidationErrors } = await validateLayoutWithApi(
+        currentLayout, depthMapUrl!, originalWidth, originalHeight
+      ));
+
+      // 5. Store Result of This Attempt
+      const currentErrorCount = currentValidationErrors?.length ?? 0;
+      attemptResults.push({
+        attemptNumber: attempt,
+        structuredLayout: currentLayout,
+        executionPlan: currentPlan,
+        validationStatus: currentValidationStatus,
+        validationErrors: currentValidationErrors,
+        errorCount: currentErrorCount,
+        analysisString: currentAnalysisString,
+      });
+
+      // 6. Check Validation and Loop Control
+      if (currentValidationStatus === 'success') {
+        console.log(`Attempt ${attempt}: Validation successful!`);
+        break; // Exit loop on success
+      } else {
+        console.warn(`Attempt ${attempt}: Validation status: ${currentValidationStatus}.`);
+        if (attempt < maxAttempts) {
+          // Prepare feedback for the *next* iteration
+          console.log(`Generating intelligent feedback for attempt ${attempt + 1}...`);
+          const generatedFeedback = generateRepromptFeedback(currentValidationErrors);
+
+          if (generatedFeedback) {
+            currentValidationFeedback = generatedFeedback; // Set feedback for the next loop
+            generatedFeedbacks.push(generatedFeedback); // Log feedback history
+          } else {
+            console.warn(`Attempt ${attempt}: Validation failed, but no actionable feedback generated. Stopping retries.`);
+            currentValidationFeedback = ""; // Clear feedback
+            break; // Exit loop
+          }
         } else {
-            validationStatus = "retry_parsing_failed"; // Indicate retry layout couldn't be parsed
-            console.error("Skipping validation because retry layout parsing failed.");
-            // Keep the results from the first attempt in this case? Or clear them?
-            // Let's keep the first attempt's layout/plan but mark validation as failed.
-            validationStatus = 'failed'; // Revert status as retry parse failed
-            // Errors from first validation are already stored in validationErrors
+          console.error(`Max attempts (${maxAttempts}) reached. Final validation status: ${currentValidationStatus}`);
         }
+      }
+    } // End of attempt loop
+
+    // --- Loop Finished - Determine Best Attempt ---
+    console.log("\n--- Determining Best Attempt ---");
+    let bestAttempt: AttemptResult | null = null;
+
+    if (attemptResults.length > 0) {
+      // Prioritize success first
+      const successfulAttempts = attemptResults.filter(r => r.validationStatus === 'success');
+      if (successfulAttempts.length > 0) {
+        bestAttempt = successfulAttempts[0]; // Take the first success
+        console.log(`Selected best attempt: #${bestAttempt.attemptNumber} (Validation Passed)`);
+      } else {
+        // No success, find the one with the minimum number of errors
+        // Filter out attempts that failed due to Gemini/Parsing errors (high error counts) unless they are the *only* results
+        const validAttempts = attemptResults.filter(r => r.errorCount < 900);
+         if (validAttempts.length > 0) {
+            validAttempts.sort((a, b) => a.errorCount - b.errorCount);
+            bestAttempt = validAttempts[0];
+             console.log(`Selected best attempt: #${bestAttempt.attemptNumber} (Failed Validation, Min Errors: ${bestAttempt.errorCount})`);
+         } else {
+             // If only Gemini/Parsing errors occurred, maybe pick the last attempt? Or none?
+             // Let's pick the last one stored for now, even if it failed early.
+             bestAttempt = attemptResults[attemptResults.length - 1];
+             console.warn(`Selected best attempt: #${bestAttempt.attemptNumber} (Failed early: ${bestAttempt.validationStatus}). Review manually.`);
+         }
+      }
+    } else {
+      console.log("No attempts were completed or stored.");
     }
+
 
     // --- Final Logging and Response ---
-    console.log("\n--- Final Results ---");
+    console.log("\n--- Final Results (Based on Best Attempt) ---");
+    // Log details from the 'bestAttempt' object
     console.log({
+      selectedAttemptNumber: bestAttempt?.attemptNumber,
+      finalValidationStatus: bestAttempt?.validationStatus,
+      finalValidationErrorCount: bestAttempt?.errorCount,
+      finalValidationErrors: bestAttempt?.validationErrors,
+      // Log assets generated initially
       originalImage: originalImageUrl,
       cannyMap: cannyMapUrl,
       depthMap: depthMapUrl,
       furnishedImage: furnishedImageUrl,
-      furnitureList: furnitureList,
-      groundingData: groundingData, // Maybe exclude large data from final log?
-      structuredLayout: structuredLayout, // Final layout (either from attempt 1 or 2)
-      executionPlan: executionPlan,     // Final plan (either from attempt 1 or 2)
-      validationStatus: validationStatus, // Final validation status
-      validationErrors: validationErrors  // Final validation errors (from last attempt)
-      // finalAnalysisString: finalAnalysisString // Optional: log the raw string
+      // Log the selected layout/plan
+      structuredLayout: bestAttempt?.structuredLayout,
+      executionPlan: bestAttempt?.executionPlan,
+      // Log feedback history
+      generatedFeedbacks: generatedFeedbacks
+      // bestAttemptAnalysisString: bestAttempt?.analysisString // Optional: Log the raw string of the best attempt
     });
 
+    // Return data from the 'bestAttempt'
     return NextResponse.json({
-      success: true, // API call itself succeeded, check validationStatus in data
-      message: `Processing completed. Validation status: ${validationStatus}`,
+      success: true, // API call itself succeeded
+      message: `Processing completed. Best attempt: #${bestAttempt?.attemptNumber ?? 'N/A'}, Final validation status: ${bestAttempt?.validationStatus ?? 'unknown'}`,
       data: {
-          originalImageUrl,
-          cannyMapUrl,
-          depthMapUrl,
-          furnishedImageUrl,
-          // furnitureList, // Maybe omit from response?
-          // groundingData, // Maybe omit from response?
-          structuredLayout,
-          executionPlan,
-          validationStatus,
-          validationErrors
+        originalImageUrl,
+        cannyMapUrl,
+        depthMapUrl,
+        furnishedImageUrl,
+        structuredLayout: bestAttempt?.structuredLayout ?? null, // Use null if no best attempt
+        executionPlan: bestAttempt?.executionPlan ?? null,
+        validationStatus: bestAttempt?.validationStatus ?? 'no_valid_attempt',
+        validationErrors: bestAttempt?.validationErrors ?? [],
+        attemptNumberSelected: bestAttempt?.attemptNumber
       }
     });
 
