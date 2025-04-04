@@ -19,8 +19,10 @@ async function imageUrlToBase64(url: string): Promise<string> {
 
 export async function analyzeImageWithGemini(
   imageUrl: string, 
-  cannyUrl: string, 
   depthUrl: string, 
+  cannyUrl: string, 
+  furnishedImageUrl: string,
+  florenceResults: any,
   userPrompt: string, 
   imageWidth: number, 
   imageHeight: number
@@ -28,18 +30,20 @@ export async function analyzeImageWithGemini(
   try {
     // Convert all images to base64 first to handle any potential failures early
     const [
-      image1, image2, image3
+      image1, image2, image3, image4
     ] = await Promise.all([
       imageUrlToBase64(imageUrl),
       imageUrlToBase64(depthUrl),
       imageUrlToBase64(cannyUrl),
+      imageUrlToBase64(furnishedImageUrl),
     ]);
 
     // Read and prepare the prompt template
-    const promptTemplate = fs.readFileSync('src/app/utils/goated-gpt-4o-prompt.txt', 'utf8');
+    const promptTemplate = fs.readFileSync('src/app/utils/goated-gemini-prompt.txt', 'utf8');
     const filledPrompt = promptTemplate
         .replace('[PLACEHOLDER FOR IMAGE_DIMENSIONS]', `${imageWidth}x${imageHeight}`)
-        .replace('[PLACEHOLDER FOR USER_STYLE_PROMPT]', userPrompt);
+        .replace('[PLACEHOLDER FOR USER_STYLE_PROMPT]', userPrompt)
+        .replace('[PLACEHOLDER FOR FLORENCE_JSON]', JSON.stringify(florenceResults));
 
     // Following documentation best practice: put images first for better results
     const contents = [
@@ -47,6 +51,7 @@ export async function analyzeImageWithGemini(
         { inlineData: { data: image1, mimeType: "image/jpeg" } },          // Image A: Original empty interior        // Image C: Hallucinated furnished interior
         { inlineData: { data: image2, mimeType: "image/jpeg" } },          // Image B: Depth (non-gridded)
         { inlineData: { data: image3, mimeType: "image/jpeg" } },          // Image C: Canny (non-gridded)
+        { inlineData: { data: image4, mimeType: "image/jpeg" } },          // Image D: Furnished image
         // Text prompt last
         { text: filledPrompt }
     ];
