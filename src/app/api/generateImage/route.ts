@@ -80,14 +80,15 @@ async function generateDepthMap(imageUrl: string, originalWidth: number, origina
       },
     });
 
-    // Resize the depth map
-    const resizedDepthBuffer = await resizeImage(result.data.image.url, originalWidth, originalHeight);
-    
-    // Upload the resized depth map
-    const resizedDepthFile = new File([resizedDepthBuffer], 'resized-depth.jpg', { type: 'image/jpeg' });
-    const resizedDepthUrl = await fal.storage.upload(resizedDepthFile);
-    
-    return resizedDepthUrl;
+    // --- RETURN ORIGINAL URL DIRECTLY --- 
+    const originalDepthUrl = result.data.image.url;
+    if (typeof originalDepthUrl !== 'string' || !originalDepthUrl) {
+      console.error("Marigold response structure:", JSON.stringify(result, null, 2));
+      throw new Error("Depth map URL not found or not a string in Marigold response");
+    }
+    console.log("Using original Marigold depth map URL:", originalDepthUrl);
+    return originalDepthUrl;
+    // --- END RETURN ORIGINAL --- 
 
   } catch (error) {
     console.error("Error generating depth map:", error);
@@ -293,7 +294,7 @@ export async function POST(request: NextRequest) {
     
 
     // // Analyze the image using GPT-4o with all context
-    const analysis = await analyzeImageWithVision(
+    const analysisString = await analyzeImageWithVision(
       originalImageUrl,
       depthMapUrl,
       cannyMapUrl,
@@ -306,10 +307,116 @@ export async function POST(request: NextRequest) {
     );
 
     // // Ensure analysis is valid before proceeding
-    if (typeof analysis !== 'string' || !analysis) {
-      console.error("Analysis result is not a valid string:", analysis);
-      throw new Error("Failed to get valid analysis from vision model");
+    if (typeof analysisString !== 'string' || !analysisString) {
+      console.error("Analysis result is not a valid string:", analysisString);
+      throw new Error("Failed to get valid analysis string from vision model");
     }
+    
+    // --- NEW: Parse the analysis string and extract structured_layout ---
+    let structuredLayout = null;
+    let executionPlan = null;
+    let analysisJson = null; // To hold the full parsed object
+
+    try {
+      // --- UPDATED CLEANING LOGIC ---
+      let jsonStringToParse = analysisString; // Assume no fences initially
+      const match = analysisString.match(/^```json\s*([\s\S]*?)\s*```$/); 
+      // Check if the regex matched and captured content (group 1)
+      if (match && match[1]) {
+        jsonStringToParse = match[1]; // Use only the captured content
+        console.log("Extracted JSON content from fences.");
+      } else {
+        console.log("No JSON fences found, attempting to parse original string.");
+      }
+      // --- END UPDATED CLEANING LOGIC ---
+      
+      // Parse the potentially cleaned string
+      analysisJson = JSON.parse(jsonStringToParse); 
+      
+      if (analysisJson && typeof analysisJson === 'object') {
+        structuredLayout = analysisJson.structured_layout;
+        executionPlan = analysisJson.execution_plan; // Also extract execution_plan if needed later
+        
+        if (!Array.isArray(structuredLayout)) {
+            console.error("Parsed analysis does not contain a valid 'structured_layout' array:", analysisJson);
+            structuredLayout = null; // Reset if invalid
+        } else {
+            console.log("Successfully extracted structured_layout:", structuredLayout);
+        }
+        // Optional: Add similar validation for executionPlan if you use it
+        
+      } else {
+         console.error("Parsed analysis is not a valid object:", analysisJson);
+      }
+      
+    } catch (parseError) {
+      console.error("Failed to parse analysis string as JSON:", parseError);
+      console.error("Original analysis string:", analysisString);
+      // Decide how to handle the error, maybe return an error response or proceed without the layout
+      throw new Error("Failed to parse layout data from vision model response."); 
+    }
+    // --- END NEW ---
+
+    // --- NEW: Call Flask Validation API ---
+    let validationErrors: any[] = []; // Initialize as empty array
+    let validationStatus: string = "not_run"; // Track status
+
+    if (structuredLayout && depthMapUrl && originalWidth && originalHeight) {
+      const validationApiUrl = process.env.VALIDATION_API_URL || 'http://localhost:5001/validate_layout'; // Use env var or default
+      console.log(`Calling validation API at: ${validationApiUrl}`);
+
+      try {
+        const validationResponse = await fetch(validationApiUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            layout: structuredLayout,
+            image_dimensions: { width: originalWidth, height: originalHeight },
+            depth_map_url: depthMapUrl, // Send the generated depth map URL
+          }),
+          // Add a timeout (optional but recommended)
+          signal: AbortSignal.timeout(30000) // 30 seconds timeout
+        });
+
+        if (!validationResponse.ok) {
+          // Handle HTTP errors from Flask (e.g., 400, 500)
+          const errorBody = await validationResponse.text(); // Read error body as text first
+          console.error(`Validation API returned error ${validationResponse.status}: ${errorBody}`);
+          validationStatus = "api_error";
+          // Optionally, rethrow or add a generic error to validationErrors
+          // validationErrors.push({ check: "API", message: `Validation API failed with status ${validationResponse.status}`}); 
+        } else {
+          const validationResult = await validationResponse.json();
+          if (validationResult.status === 'success') {
+            validationStatus = "success";
+            console.log("Layout validation successful.");
+          } else if (validationResult.status === 'error') {
+            validationStatus = "failed";
+            validationErrors = validationResult.errors || []; // Ensure errors is an array
+            console.warn(`Layout validation failed with ${validationErrors.length} errors.`);
+            console.warn("Validation Errors:", JSON.stringify(validationErrors, null, 2)); 
+          } else {
+             validationStatus = "unknown_response";
+             console.error("Validation API returned unexpected status:", validationResult);
+          }
+        }
+      } catch (validationError) {
+         validationStatus = "network_error";
+         if (validationError instanceof Error && validationError.name === 'TimeoutError') {
+             console.error("Validation API call timed out:", validationError);
+         } else {
+            console.error("Error calling validation API:", validationError);
+         }
+         // Optionally, add a generic error to validationErrors
+         // validationErrors.push({ check: "Network", message: "Failed to connect to validation API." });
+      }
+    } else {
+        console.warn("Skipping validation API call due to missing data (layout, depth map, or dimensions).");
+        validationStatus = "skipped";
+    }
+    // --- END NEW ---
 
     // Log all generated URLs and data
     console.log({
@@ -318,18 +425,36 @@ export async function POST(request: NextRequest) {
       depthMap: depthMapUrl,
       furnishedImage: furnishedImageUrl,
       furnitureList: furnitureList,
-      groundingData: groundingData
+      groundingData: groundingData,
+      structuredLayout: structuredLayout, 
+      executionPlan: executionPlan,     
+      validationStatus: validationStatus, // Log validation status
+      validationErrors: validationErrors  // Log validation errors
     });
 
+    // --- UPDATE RESPONSE: Include validation results ---
     return NextResponse.json({ 
       success: true, 
-      message: "Images processed and uploaded successfully",
-    })
+      message: "Images processed, analyzed, and validated successfully", // Updated message
+      data: {
+          originalImageUrl,
+          cannyMapUrl,
+          depthMapUrl,
+          furnishedImageUrl,
+          furnitureList,
+          groundingData,
+          structuredLayout, 
+          executionPlan,
+          validationStatus, // Include validation status
+          validationErrors  // Include validation errors
+      }
+    });
   } catch (error) {
-    console.error("Error in generateImage:", error)
+    console.error("Error in generateImage:", error);
+    const errorMessage = error instanceof Error ? error.message : "Unknown error";
     return NextResponse.json(
-      { success: false, error: "Failed to process request" },
+      { success: false, error: `Failed to process request: ${errorMessage}` },
       { status: 500 }
-    )
+    );
   }
 } 
