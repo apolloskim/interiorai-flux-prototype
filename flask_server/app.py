@@ -7,6 +7,12 @@ import json
 import io # For handling image bytes
 import requests # For fetching URL
 from flask import Flask, request, jsonify
+import base64
+from PIL import Image, ImageFilter, ImageDraw # Pillow for drawing/blur
+# import cv2 # Import OpenCV if using distance transform or advanced ops
+# Assuming fal client is setup if uploading directly from Flask,
+# OR return base64 and let Node upload
+# from fal import storage # If needed
 
 # --- Try importing Open3D ---
 try:
@@ -385,6 +391,72 @@ def handle_validation():
             serializable_errors.append(serializable_err)
 
         return jsonify({"status": "error", "errors": serializable_errors})
+
+# --- NEW MASK GENERATION ENDPOINT ---
+@app.route('/generate_mask', methods=['POST'])
+def handle_mask_generation():
+    print("Received mask generation request...")
+    if not request.is_json:
+        return jsonify({"error": "Request must be JSON"}), 400
+
+    data = request.get_json()
+    bounding_boxes = data.get('bounding_boxes') # Expect [[xmin, ymin, xmax, ymax], ...]
+    dimensions = data.get('image_dimensions')   # Expect { "width": w, "height": h }
+    blur_sigma = float(data.get('blur_sigma', 10.0)) # Default sigma = 10.0
+
+    if not bounding_boxes or not isinstance(bounding_boxes, list) or \
+       not dimensions or 'width' not in dimensions or 'height' not in dimensions:
+        return jsonify({"error": "Missing/invalid fields: bounding_boxes, image_dimensions"}), 400
+
+    width = dimensions['width']
+    height = dimensions['height']
+
+    try:
+        # --- Generate Mask using Pillow (Gaussian Blur) ---
+        # 1. Create black background (L mode = 8-bit grayscale)
+        mask_img = Image.new('L', (width, height), 0)
+        draw = ImageDraw.Draw(mask_img)
+
+        # 2. Draw white filled rectangles
+        for box in bounding_boxes:
+             # Clip box coordinates using helper (ensure clip_box is defined)
+             clipped_box = clip_box(box, width, height)
+             if clipped_box[2] > clipped_box[0] and clipped_box[3] > clipped_box[1]: # Check for valid area
+                  draw.rectangle(clipped_box, fill=255) # Use integer coordinates
+
+        # 3. Apply Gaussian Blur
+        if blur_sigma > 0:
+            # Pillow's GaussianBlur uses radius, roughly sigma*2 or sigma*3
+            # Experiment with radius value
+            radius = max(1, int(round(blur_sigma * 2)))
+            mask_img = mask_img.filter(ImageFilter.GaussianBlur(radius=radius))
+
+        # 4. Convert to Bytes (e.g., PNG)
+        img_byte_arr = io.BytesIO()
+        mask_img.save(img_byte_arr, format='PNG')
+        img_byte_arr = img_byte_arr.getvalue()
+
+        # 5. Return as Base64 or Upload and return URL
+        # Option A: Return Base64 encoded PNG
+        img_base64 = base64.b64encode(img_byte_arr).decode('utf-8')
+        print(f"Generated blurred mask (sigma={blur_sigma}), returning base64.")
+        return jsonify({
+            "status": "success",
+            "mask_b64": img_base64,
+            "format": "png"
+        })
+
+        # Option B: Upload to Fal Storage (if fal client configured here)
+        # mask_file = io.BytesIO(img_byte_arr) # Wrap bytes for upload
+        # mask_url = storage.upload(mask_file, content_type='image/png')
+        # print(f"Generated blurred mask (sigma={blur_sigma}), uploaded to: {mask_url}")
+        # return jsonify({"status": "success", "mask_url": mask_url})
+
+    except Exception as e:
+        print(f"ERROR generating mask: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": "Internal server error during mask generation."}), 500
 
 # --- Run Flask App ---
 if __name__ == '__main__':

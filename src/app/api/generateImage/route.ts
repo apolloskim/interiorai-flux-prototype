@@ -4,6 +4,9 @@ import sharp from 'sharp'
 import OpenAI from 'openai'
 import { analyzeImageWithGemini } from '@/app/utils/gemini'
 import fs from 'fs'
+import { Buffer } from 'buffer'
+import * as fsPromises from 'fs/promises'
+import path from 'path'
 
 if (!process.env.FAL_KEY) {
   throw new Error("FAL_KEY environment variable is not set")
@@ -12,6 +15,10 @@ if (!process.env.FAL_KEY) {
 if (!process.env.OPENAI_API_KEY) {
   throw new Error("OPENAI_API_KEY environment variable is not set")
 }
+
+// Optional: Make Flask backend URL configurable
+const MASK_GENERATION_API_URL = process.env.MASK_GENERATION_API_URL || 'http://localhost:5001/generate_mask'
+const VALIDATION_API_URL = process.env.VALIDATION_API_URL || 'http://localhost:5001/validate_layout'
 
 const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
@@ -25,16 +32,46 @@ interface ValidationError {
   relatedObject?: string;
 }
 
+// Structure for items in structuredLayout
+interface LayoutItem {
+    object: string;
+    description: string;
+    prompt: string;
+    bounding_box: [number, number, number, number];
+    spatial_anchor: string;
+}
+
+// Structure for items in executionPlan
+interface ExecutionStep {
+    step: number;
+    model: string;
+    input_image: string; // Placeholder name
+    object?: string; // Single object case
+    objects?: string[]; // Multiple objects case
+    prompt: string;
+    mask: string; // Placeholder name - WILL BE REPLACED/USED
+    controlnet_unions: any[]; // Define more specifically if possible
+    note: string;
+}
+
+
 // NEW Interface for storing attempt results
 interface AttemptResult {
   attemptNumber: number;
-  structuredLayout: any[] | null; // Use specific type if available
-  executionPlan: any[] | null; // Use specific type if available
+  structuredLayout: LayoutItem[] | null; // Use specific type
+  executionPlan: ExecutionStep[] | null; // Use specific type
   validationStatus: string; // Keep as string to handle various statuses
   validationErrors: ValidationError[] | null;
   errorCount: number;
   analysisString: string | null; // Store the raw analysis string for this attempt
 }
+
+// Interface for the combined execution plan step (adding mask URL)
+interface CombinedExecutionStep extends ExecutionStep {
+    layoutDetails: LayoutItem[]; // Add the resolved layout info
+    generatedMaskUrl?: string; // Store the URL of the generated mask for this step
+}
+
 
 async function getImageDimensions(buffer: Buffer): Promise<{ width: number; height: number }> {
   const metadata = await sharp(buffer).metadata();
@@ -49,7 +86,7 @@ async function resizeImage(imageUrl: string, targetWidth: number, targetHeight: 
   const response = await fetch(imageUrl);
   const arrayBuffer = await response.arrayBuffer();
   const buffer = Buffer.from(arrayBuffer);
-  
+
   return await sharp(buffer)
     .resize(targetWidth, targetHeight, {
       fit: 'fill'
@@ -72,12 +109,12 @@ async function generateCannyMap(imageUrl: string, originalWidth: number, origina
     });
 
     // Resize the canny map
-    const resizedCannyBuffer = await resizeImage(result.data.image.url, originalWidth, originalHeight);
-    
+    const resizedCannyBuffer = await resizeImage((result.data as any).image.url, originalWidth, originalHeight);
+
     // Upload the resized canny map
     const resizedCannyFile = new File([resizedCannyBuffer], 'resized-canny.jpg', { type: 'image/jpeg' });
     const resizedCannyUrl = await fal.storage.upload(resizedCannyFile);
-    
+
     return resizedCannyUrl;
   } catch (error) {
     console.error("Error generating canny map:", error);
@@ -100,15 +137,15 @@ async function generateDepthMap(imageUrl: string, originalWidth: number, origina
       },
     });
 
-    // --- RETURN ORIGINAL URL DIRECTLY --- 
-    const originalDepthUrl = result.data.image.url;
+    // --- RETURN ORIGINAL URL DIRECTLY ---
+    const originalDepthUrl = (result.data as any).image.url;
     if (typeof originalDepthUrl !== 'string' || !originalDepthUrl) {
       console.error("Marigold response structure:", JSON.stringify(result, null, 2));
       throw new Error("Depth map URL not found or not a string in Marigold response");
     }
     console.log("Using original Marigold depth map URL:", originalDepthUrl);
     return originalDepthUrl;
-    // --- END RETURN ORIGINAL --- 
+    // --- END RETURN ORIGINAL ---
 
   } catch (error) {
     console.error("Error generating depth map:", error);
@@ -128,7 +165,7 @@ async function generateFurnishedImage(imageUrl: string, prompt: string): Promise
         // Dynamic values
         image_url: imageUrl,
         prompt: prompt, // Use the analysis from Gemini/GPT-4o here
-        
+
         // Static parameters from user request
         loras: [],
         strength: 0.85,
@@ -161,7 +198,7 @@ async function generateFurnishedImage(imageUrl: string, prompt: string): Promise
         console.error("Fal response structure:", JSON.stringify(result, null, 2));
         throw new Error("Furnished image URL not found or not a string in fal response");
     }
-    
+
     console.log("Furnished image generated:", furnishedUrl);
     return furnishedUrl;
   } catch (error) {
@@ -229,7 +266,7 @@ async function getGroundingDataFromFlorence(imageUrl: string, furnitureList: str
       console.error("Florence-2 response structure:", JSON.stringify(result, null, 2));
       throw new Error("Grounding data not found in Florence-2 response");
     }
-    
+
     console.log("Florence-2 Grounding Data:", groundingData);
     return groundingData;
 
@@ -256,9 +293,9 @@ function prepareGeminiPrompt(
 }
 
 // Helper Function to Parse Gemini Response
-function parseGeminiResponse(analysisString: string | null | undefined): { structuredLayout: any[] | null, executionPlan: any[] | null } {
-    let structuredLayout = null;
-    let executionPlan = null;
+function parseGeminiResponse(analysisString: string | null | undefined): { structuredLayout: LayoutItem[] | null, executionPlan: ExecutionStep[] | null } {
+    let structuredLayout: LayoutItem[] | null = null;
+    let executionPlan: ExecutionStep[] | null = null;
 
     if (typeof analysisString !== 'string' || !analysisString) {
         console.error("Analysis result is null or not a string:", analysisString);
@@ -311,10 +348,10 @@ function parseGeminiResponse(analysisString: string | null | undefined): { struc
     } catch (parseError: unknown) {
         console.error("Failed to parse JSON string:", parseError);
         console.error(`String attempted to parse (extracted: ${didExtract}):`, jsonStringToParse); // Log the string that failed + if extraction happened
-        
+
         // Type check before accessing properties
         const errorMessage = parseError instanceof Error ? parseError.message : String(parseError);
-        
+
         // Re-throw error to be caught by the main handler
         throw new Error(`Failed to parse JSON response after processing: ${errorMessage}`);
     }
@@ -324,20 +361,20 @@ function parseGeminiResponse(analysisString: string | null | undefined): { struc
 
 // Helper Function to Validate Layout
 async function validateLayoutWithApi(
-    layout: any[] | null,
+    layout: LayoutItem[] | null,
     depthMapUrl: string | null,
     imageWidth: number,
     imageHeight: number
-): Promise<{ validationStatus: string, validationErrors: any[] }> {
-    let validationErrors: any[] = [];
+): Promise<{ validationStatus: string, validationErrors: ValidationError[] }> {
+    let validationErrors: ValidationError[] = [];
     let validationStatus: string = "not_run";
 
     if (layout && depthMapUrl && imageWidth && imageHeight) {
-      const validationApiUrl = process.env.VALIDATION_API_URL || 'http://localhost:5001/validate_layout';
-      console.log(`Calling validation API at: ${validationApiUrl}`);
+      // const validationApiUrl = process.env.VALIDATION_API_URL || 'http://localhost:5001/validate_layout'; // Use constant
+      console.log(`Calling validation API at: ${VALIDATION_API_URL}`);
 
       try {
-        const validationResponse = await fetch(validationApiUrl, {
+        const validationResponse = await fetch(VALIDATION_API_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -359,7 +396,13 @@ async function validateLayoutWithApi(
             console.log("Layout validation successful.");
           } else if (validationResult.status === 'error') {
             validationStatus = "failed";
-            validationErrors = validationResult.errors || [];
+            // Ensure validationErrors conforms to the interface
+            validationErrors = (validationResult.errors || []).map((err: any): ValidationError => ({
+                 object: typeof err.object === 'string' ? err.object : 'unknown',
+                 check: typeof err.check === 'string' ? err.check : 'UnknownCheck', // Add default or handle error
+                 message: typeof err.message === 'string' ? err.message : 'Unknown error message',
+                 relatedObject: typeof err.relatedObject === 'string' ? err.relatedObject : undefined,
+            }));
             console.warn(`Layout validation failed with ${validationErrors.length} errors.`);
             console.warn("Validation Errors:", JSON.stringify(validationErrors, null, 2));
           } else {
@@ -461,7 +504,7 @@ function generateRepromptFeedback(
 
         } else {
            // Fallback if regex fails
-            const anchorName = error.object || 'unknown_object'; 
+            const anchorName = error.object || 'unknown_object';
            instruction = `Revise placement depth for '${obj_name}' (anchor '${anchorName}') - failed depth consistency check. Message: ${message}`;
         }
 
@@ -510,15 +553,7 @@ Adhere to all original requirements and guardrails. Ensure the output is ONLY th
 
 // --- MAIN POST FUNCTION (Modify loop inside) ---
 export async function POST(request: NextRequest) {
-  // Variables to hold the results across attempts
-  let structuredLayout: any[] | null = null;
-  let executionPlan: any[] | null = null;
-  let validationStatus: string = "not_run";
-  let validationErrors: any[] = [];
-  let finalAnalysisString: string | null = null; // Store the string that produced the final layout
-  let generatedFeedbacks: string[] = []; // <<< NEW: Array to store feedback strings
-
-  // Variables for data generated once
+  let generatedFeedbacks: string[] = [];
   let originalImageUrl: string | null = null;
   let cannyMapUrl: string | null = null;
   let depthMapUrl: string | null = null;
@@ -529,11 +564,8 @@ export async function POST(request: NextRequest) {
   let originalWidth: number = 0;
   let originalHeight: number = 0;
   let userPrompt: string = "";
-  let model: 'gpt4o' | 'gemini' = 'gemini'; // Default or from request
-
-  // NEW: Store results of each attempt
+  let model: 'gpt4o' | 'gemini' = 'gemini';
   let attemptResults: AttemptResult[] = [];
-
   const maxAttempts = 3;
 
   try {
@@ -551,7 +583,8 @@ export async function POST(request: NextRequest) {
 
     const imageBuffer = Buffer.from(await image.arrayBuffer());
     ({ width: originalWidth, height: originalHeight } = await getImageDimensions(imageBuffer));
-    console.log("Original image dimensions:", { width: originalWidth, height: originalHeight });
+    const imageDimensions = { width: originalWidth, height: originalHeight }; // Store dimensions
+    console.log("Original image dimensions:", imageDimensions);
     originalImageUrl = await fal.storage.upload(image);
 
     // --- Generate Supporting Assets (Done once) ---
@@ -563,113 +596,87 @@ export async function POST(request: NextRequest) {
     furnishedImageUrl = await generateFurnishedImage(originalImageUrl!, userPrompt);
     furnitureList = await getFurnitureListFromSA2VA(furnishedImageUrl!);
     groundingData = await getGroundingDataFromFlorence(furnishedImageUrl!, furnitureList!);
-    florenceResults = groundingData.results; // Assuming results exist
+    florenceResults = groundingData.results;
     console.log("--- Supporting Assets Generated ---");
 
     // --- Loop for Generation and Validation ---
-    let currentValidationFeedback = ""; // Feedback for the *next* prompt
+    let currentValidationFeedback = "";
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       console.log(`\n--- Attempt ${attempt} of ${maxAttempts}: Layout Generation ---`);
-
-      // Vars for this specific attempt's results
       let currentAnalysisString: string | null = null;
-      let currentLayout: any[] | null = null;
-      let currentPlan: any[] | null = null;
+      let currentLayout: LayoutItem[] | null = null;
+      let currentPlan: ExecutionStep[] | null = null;
       let currentValidationStatus: string = "not_run";
       let currentValidationErrors: ValidationError[] = [];
 
-      // 1. Prepare Prompt
       let currentPrompt = prepareGeminiPrompt(
-        currentValidationFeedback, // Use feedback from *previous* attempt
-        florenceResults!,
-        userPrompt,
-        originalWidth,
-        originalHeight
+        currentValidationFeedback, florenceResults!, userPrompt, originalWidth, originalHeight
       );
 
-      // 2. Call Gemini
       try {
         currentAnalysisString = await analyzeImageWithGemini(
           originalImageUrl!, depthMapUrl!, cannyMapUrl!, furnishedImageUrl!,
-          florenceResults!, currentPrompt,
-          originalWidth, originalHeight
+          florenceResults!, currentPrompt, originalWidth, originalHeight
         );
       } catch (geminiError: any) {
         console.error(`Attempt ${attempt}: Error calling Gemini - ${geminiError.message}`);
         currentValidationStatus = `attempt_${attempt}_gemini_error`;
-        // Store this failed attempt result
         attemptResults.push({
-            attemptNumber: attempt,
-            structuredLayout: null,
-            executionPlan: null,
-            validationStatus: currentValidationStatus,
-            validationErrors: [],
-            errorCount: 999, // Assign high error count on Gemini failure
-            analysisString: null,
+            attemptNumber: attempt, structuredLayout: null, executionPlan: null,
+            validationStatus: currentValidationStatus, validationErrors: [], errorCount: 999, analysisString: null,
         });
         if (attempt === maxAttempts) break;
-        continue; // Try next attempt
+        currentValidationFeedback = "Gemini failed to respond. Retrying generation.";
+        generatedFeedbacks.push(currentValidationFeedback);
+        continue;
       }
 
-      // 3. Parse Response
       try {
            ({ structuredLayout: currentLayout, executionPlan: currentPlan } = parseGeminiResponse(currentAnalysisString));
-           if (!currentLayout || !currentPlan) {
-                throw new Error("Parsing failed or returned null layout/plan.");
+           if (!currentLayout || !currentPlan || currentLayout.length === 0 || currentPlan.length === 0) {
+                throw new Error("Parsing failed or returned null/empty layout or plan.");
            }
       } catch (parseError: any) {
           console.error(`Attempt ${attempt}: Parsing failed - ${parseError.message}`);
           currentValidationStatus = `attempt_${attempt}_parsing_failed`;
-           // Store this failed attempt result
            attemptResults.push({
-                attemptNumber: attempt,
-                structuredLayout: null, // Parsed layout is null
-                executionPlan: null, // Parsed plan is null
-                validationStatus: currentValidationStatus,
-                validationErrors: [],
-                errorCount: 998, // Assign high error count on parse failure
-                analysisString: currentAnalysisString, // Store the string that failed
+                attemptNumber: attempt, structuredLayout: null, executionPlan: null,
+                validationStatus: currentValidationStatus, validationErrors: [], errorCount: 998,
+                analysisString: currentAnalysisString,
            });
           if (attempt === maxAttempts) break;
-          continue; // Try next attempt
+          currentValidationFeedback = "Failed to parse the previous response. Retrying generation with stricter JSON format request.";
+          generatedFeedbacks.push(currentValidationFeedback);
+          continue;
       }
 
-      // 4. Validate Layout
       console.log(`--- Attempt ${attempt}: Validating Layout ---`);
       ({ validationStatus: currentValidationStatus, validationErrors: currentValidationErrors } = await validateLayoutWithApi(
         currentLayout, depthMapUrl!, originalWidth, originalHeight
       ));
 
-      // 5. Store Result of This Attempt
       const currentErrorCount = currentValidationErrors?.length ?? 0;
       attemptResults.push({
-        attemptNumber: attempt,
-        structuredLayout: currentLayout,
-        executionPlan: currentPlan,
-        validationStatus: currentValidationStatus,
-        validationErrors: currentValidationErrors,
-        errorCount: currentErrorCount,
-        analysisString: currentAnalysisString,
+        attemptNumber: attempt, structuredLayout: currentLayout, executionPlan: currentPlan,
+        validationStatus: currentValidationStatus, validationErrors: currentValidationErrors,
+        errorCount: currentErrorCount, analysisString: currentAnalysisString,
       });
 
-      // 6. Check Validation and Loop Control
       if (currentValidationStatus === 'success') {
         console.log(`Attempt ${attempt}: Validation successful!`);
-        break; // Exit loop on success
+        break;
       } else {
         console.warn(`Attempt ${attempt}: Validation status: ${currentValidationStatus}.`);
         if (attempt < maxAttempts) {
-          // Prepare feedback for the *next* iteration
           console.log(`Generating intelligent feedback for attempt ${attempt + 1}...`);
           const generatedFeedback = generateRepromptFeedback(currentValidationErrors);
-
           if (generatedFeedback) {
-            currentValidationFeedback = generatedFeedback; // Set feedback for the next loop
-            generatedFeedbacks.push(generatedFeedback); // Log feedback history
+            currentValidationFeedback = generatedFeedback;
+            generatedFeedbacks.push(generatedFeedback);
           } else {
-            console.warn(`Attempt ${attempt}: Validation failed, but no actionable feedback generated. Stopping retries.`);
-            currentValidationFeedback = ""; // Clear feedback
-            break; // Exit loop
+            console.warn(`Attempt ${attempt}: Validation failed (${currentValidationStatus}), but no actionable feedback generated. Stopping retries.`);
+            currentValidationFeedback = "";
+            break;
           }
         } else {
           console.error(`Max attempts (${maxAttempts}) reached. Final validation status: ${currentValidationStatus}`);
@@ -680,65 +687,217 @@ export async function POST(request: NextRequest) {
     // --- Loop Finished - Determine Best Attempt ---
     console.log("\n--- Determining Best Attempt ---");
     let bestAttempt: AttemptResult | null = null;
-
     if (attemptResults.length > 0) {
-      // Prioritize success first
       const successfulAttempts = attemptResults.filter(r => r.validationStatus === 'success');
       if (successfulAttempts.length > 0) {
-        bestAttempt = successfulAttempts[0]; // Take the first success
+        bestAttempt = successfulAttempts[0];
         console.log(`Selected best attempt: #${bestAttempt.attemptNumber} (Validation Passed)`);
       } else {
-        // No success, find the one with the minimum number of errors
-        // Filter out attempts that failed due to Gemini/Parsing errors (high error counts) unless they are the *only* results
-        const validAttempts = attemptResults.filter(r => r.errorCount < 900);
+        const validAttempts = attemptResults.filter(r => r.errorCount < 900 && r.structuredLayout && r.executionPlan);
          if (validAttempts.length > 0) {
             validAttempts.sort((a, b) => a.errorCount - b.errorCount);
             bestAttempt = validAttempts[0];
              console.log(`Selected best attempt: #${bestAttempt.attemptNumber} (Failed Validation, Min Errors: ${bestAttempt.errorCount})`);
          } else {
-             // If only Gemini/Parsing errors occurred, maybe pick the last attempt? Or none?
-             // Let's pick the last one stored for now, even if it failed early.
-             bestAttempt = attemptResults[attemptResults.length - 1];
-             console.warn(`Selected best attempt: #${bestAttempt.attemptNumber} (Failed early: ${bestAttempt.validationStatus}). Review manually.`);
+             const attemptsWithData = attemptResults.filter(r => r.analysisString);
+             if (attemptsWithData.length > 0) {
+                bestAttempt = attemptsWithData[attemptsWithData.length - 1];
+                 console.warn(`Selected best attempt: #${bestAttempt.attemptNumber} (Failed early: ${bestAttempt.validationStatus}). Layout/Plan might be missing or invalid.`);
+             } else {
+                 bestAttempt = attemptResults[attemptResults.length - 1];
+                 console.error(`Selected best attempt: #${bestAttempt?.attemptNumber}. Failed very early: ${bestAttempt?.validationStatus}. No layout or plan available.`);
+             }
          }
       }
     } else {
-      console.log("No attempts were completed or stored.");
+      console.error("No attempts were completed or stored. Cannot proceed.");
+       return NextResponse.json(
+           { success: false, error: "Failed to generate or validate any layout/plan after multiple attempts." }, { status: 500 }
+       );
     }
+
+     // --- MAP EXECUTION PLAN TO LAYOUT DETAILS ---
+     console.log("\n--- Mapping Execution Plan to Layout Details ---");
+     let combinedExecutionPlan: CombinedExecutionStep[] = [];
+     const finalStructuredLayout = bestAttempt?.structuredLayout ?? [];
+     const finalExecutionPlan = bestAttempt?.executionPlan ?? [];
+
+     if (finalStructuredLayout.length > 0 && finalExecutionPlan.length > 0) {
+         const layoutMap = new Map<string, LayoutItem>();
+         for (const layoutItem of finalStructuredLayout) {
+             if (layoutItem && layoutItem.object) { layoutMap.set(layoutItem.object, layoutItem); }
+             else { console.warn("Skipping invalid item during layout map creation:", layoutItem); }
+         }
+         console.log(`Created layout map with ${layoutMap.size} items.`);
+
+         for (const step of finalExecutionPlan) {
+             if (!step || typeof step.step !== 'number') {
+                 console.warn("Skipping invalid step in final executionPlan:", step); continue;
+             }
+             const stepObjects: string[] = [];
+             if (typeof step.object === 'string' && step.object) { stepObjects.push(step.object); }
+             else if (Array.isArray(step.objects) && step.objects.length > 0) {
+                 stepObjects.push(...step.objects.filter(obj => typeof obj === 'string' && obj));
+             }
+             if (stepObjects.length === 0) {
+                  console.warn(`Step ${step.step}: No valid object names found. Skipping step.`); continue;
+             }
+             const layoutDetailsForStep: LayoutItem[] = [];
+             let missingLayout = false;
+             for (const objName of stepObjects) {
+                 const layout = layoutMap.get(objName);
+                 if (layout) { layoutDetailsForStep.push(layout); }
+                 else {
+                     console.error(`Step ${step.step}: Layout details not found for object '${objName}'. This step cannot be executed.`);
+                     missingLayout = true; break;
+                 }
+             }
+             if (!missingLayout && layoutDetailsForStep.length > 0) {
+                 const combinedStep: CombinedExecutionStep = {
+                     ...(step as ExecutionStep), layoutDetails: layoutDetailsForStep
+                 };
+                 combinedExecutionPlan.push(combinedStep);
+             } else if (missingLayout) {
+                 console.warn(`Skipping Step ${step.step} due to missing layout data.`);
+             } else {
+                  console.warn(`Step ${step.step}: No valid layout details could be matched. Skipping step.`);
+             }
+         }
+         console.log(`Successfully mapped ${combinedExecutionPlan.length} execution steps.`);
+     } else {
+         console.error("Cannot create combined execution plan: Final layout or plan is missing/empty.");
+         return NextResponse.json(
+           { 
+                success: false, 
+                error: "Could not proceed: Missing valid layout or plan."
+           }, 
+           { status: 500 }
+       );
+     }
+
+     // --- START MASK GENERATION AND EXECUTION LOOP ---
+     console.log("\n--- Starting Mask Generation & Execution Loop ---");
+     let finalGeneratedImageUrl: string | null = originalImageUrl; 
+
+     // --- Ensure local mask directory exists ---
+     const localMaskDir = path.join(process.cwd(), 'public', 'generated_masks');
+     try {
+         await fsPromises.mkdir(localMaskDir, { recursive: true });
+         console.log(`Ensured local mask directory exists: ${localMaskDir}`);
+     } catch (dirError) {
+         console.error(`Failed to create local mask directory ${localMaskDir}:`, dirError);
+         // Decide if this is fatal or just prevents local saving
+         // return NextResponse.json({ success: false, error: "Failed to create mask directory" }, { status: 500 });
+     }
+     // -----------------------------------------
+
+     for (let i = 0; i < combinedExecutionPlan.length; i++) {
+         const combinedStep = combinedExecutionPlan[i];
+         console.log(`\n--- Processing Step ${combinedStep.step} (${combinedStep.note || 'No note'}) ---`);
+
+         const boundingBoxesForStep = combinedStep.layoutDetails.map(ld => ld.bounding_box);
+         if (!boundingBoxesForStep || boundingBoxesForStep.length === 0) {
+             console.warn(`Step ${combinedStep.step}: No bounding boxes found in layoutDetails. Skipping mask generation and execution.`);
+             continue;
+         }
+         console.log(`Step ${combinedStep.step}: Found ${boundingBoxesForStep.length} bounding box(es).`);
+
+         let maskUrlForStep: string | null = null;
+         try {
+             console.log(`Step ${combinedStep.step}: Calling Mask Generation API at ${MASK_GENERATION_API_URL}`);
+             const maskPayload = {
+                 bounding_boxes: boundingBoxesForStep,
+                 image_dimensions: imageDimensions,
+             };
+
+             const maskResponse = await fetch(MASK_GENERATION_API_URL, {
+                 method: 'POST',
+                 headers: { 'Content-Type': 'application/json' },
+                 body: JSON.stringify(maskPayload),
+                 signal: AbortSignal.timeout(30000)
+             });
+
+             if (!maskResponse.ok) {
+                 const errorBody = await maskResponse.text();
+                 throw new Error(`Mask generation API failed with status ${maskResponse.status}: ${errorBody}`);
+             }
+
+             const maskResult = await maskResponse.json();
+             if (maskResult.status !== 'success' || !maskResult.mask_b64) {
+                 throw new Error(`Mask generation API did not return success or mask_b64: ${JSON.stringify(maskResult)}`);
+             }
+
+             console.log(`Step ${combinedStep.step}: Received mask base64, uploading to storage...`);
+             const maskBuffer = Buffer.from(maskResult.mask_b64, 'base64');
+             const maskFileName = `mask_step_${combinedStep.step}.png`;
+
+             // --- Save mask locally --- 
+             const localMaskPath = path.join(localMaskDir, maskFileName);
+             try {
+                 await fsPromises.writeFile(localMaskPath, maskBuffer);
+                 console.log(`Step ${combinedStep.step}: Mask saved locally to ${localMaskPath}`);
+             } catch (saveError) {
+                 console.error(`Step ${combinedStep.step}: Failed to save mask locally to ${localMaskPath}:`, saveError);
+                 // Non-fatal, just log the error and continue with upload
+             }
+             // ------------------------
+
+             const maskFile = new File([maskBuffer], maskFileName, { type: 'image/png' });
+
+             maskUrlForStep = await fal.storage.upload(maskFile);
+             console.log(`Step ${combinedStep.step}: Mask uploaded successfully: ${maskUrlForStep}`);
+
+             combinedExecutionPlan[i].generatedMaskUrl = maskUrlForStep;
+
+         } catch (maskError) {
+             console.error(`Step ${combinedStep.step}: Failed to generate or upload mask:`, maskError);
+             return NextResponse.json(
+                 { success: false, error: `Failed during mask generation for step ${combinedStep.step}: ${maskError instanceof Error ? maskError.message : String(maskError)}` },
+                 { status: 500 }
+             );
+         }
+
+         if (maskUrlForStep) {
+              console.log(`Step ${combinedStep.step}: Mask URL ${maskUrlForStep} ready for inpainting.`);
+         } else {
+              console.error(`Step ${combinedStep.step}: Mask URL is null, cannot proceed with inpainting.`);
+               return NextResponse.json(
+                  { success: false, error: `Failed to obtain mask URL for step ${combinedStep.step}. Cannot proceed.` },
+                  { status: 500 }
+              );
+         }
+
+     }
+
+     console.log("\n--- Mask Generation & Execution Loop Finished ---");
 
 
     // --- Final Logging and Response ---
-    console.log("\n--- Final Results (Based on Best Attempt) ---");
-    // Log details from the 'bestAttempt' object
+    console.log("\n--- Final Results (After Mask Generation Attempt) ---");
     console.log({
-      selectedAttemptNumber: bestAttempt?.attemptNumber,
-      finalValidationStatus: bestAttempt?.validationStatus,
-      finalValidationErrorCount: bestAttempt?.errorCount,
-      finalValidationErrors: bestAttempt?.validationErrors,
-      // Log assets generated initially
-      originalImage: originalImageUrl,
-      cannyMap: cannyMapUrl,
-      depthMap: depthMapUrl,
-      furnishedImage: furnishedImageUrl,
-      // Log the selected layout/plan
-      structuredLayout: bestAttempt?.structuredLayout,
-      executionPlan: bestAttempt?.executionPlan,
-      // Log feedback history
-      generatedFeedbacks: generatedFeedbacks
-      // bestAttemptAnalysisString: bestAttempt?.analysisString // Optional: Log the raw string of the best attempt
+        selectedAttemptNumber: bestAttempt?.attemptNumber,
+        finalValidationStatus: bestAttempt?.validationStatus,
+        finalValidationErrorCount: bestAttempt?.errorCount,
+        originalImage: originalImageUrl,
+        cannyMap: cannyMapUrl,
+        depthMap: depthMapUrl,
+        combinedExecutionPlanWithMasks: combinedExecutionPlan,
+        finalGeneratedImageUrl: finalGeneratedImageUrl,
+        generatedFeedbacks: generatedFeedbacks
     });
 
-    // Return data from the 'bestAttempt'
+
+    // Return data needed for potential client-side display or next steps
     return NextResponse.json({
-      success: true, // API call itself succeeded
-      message: `Processing completed. Best attempt: #${bestAttempt?.attemptNumber ?? 'N/A'}, Final validation status: ${bestAttempt?.validationStatus ?? 'unknown'}`,
+      success: true,
+      message: `Processing completed. Best attempt: #${bestAttempt?.attemptNumber ?? 'N/A'}. Masks generated for ${combinedExecutionPlan.filter(s => s.generatedMaskUrl).length} steps.`,
       data: {
         originalImageUrl,
         cannyMapUrl,
         depthMapUrl,
-        furnishedImageUrl,
-        structuredLayout: bestAttempt?.structuredLayout ?? null, // Use null if no best attempt
-        executionPlan: bestAttempt?.executionPlan ?? null,
+        imageDimensions,
+        combinedExecutionPlan: combinedExecutionPlan,
+        finalGeneratedImageUrl: finalGeneratedImageUrl,
         validationStatus: bestAttempt?.validationStatus ?? 'no_valid_attempt',
         validationErrors: bestAttempt?.validationErrors ?? [],
         attemptNumberSelected: bestAttempt?.attemptNumber
