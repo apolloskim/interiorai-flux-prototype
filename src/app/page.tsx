@@ -41,16 +41,20 @@ export default function Home() {
 
       const data = await result.json()
 
-      if (data.success) {
-        // For now, we'll still use the placeholder image
-        setGeneratedImage("/placeholder.svg?height=800&width=800")
+      if (data.success && data.data?.finalGeneratedImageUrl) {
+        console.log("Generated Image URL:", data.data.finalGeneratedImageUrl);
+        // Use the actual final image URL from the API response
+        setGeneratedImage(data.data.finalGeneratedImageUrl);
       } else {
-        console.error('Failed to generate image:', data.error)
+        console.error('Failed to generate image or URL missing:', data.error || 'No final image URL found');
+        // Optionally set an error state or keep generatedImage null
+        setGeneratedImage(null); // Ensure it's null on failure
       }
     } catch (error) {
       console.error('Error generating image:', error)
+      setGeneratedImage(null); // Ensure it's null on catch
     } finally {
-      // Add a small delay for the transition effect
+      // Add a small delay for the transition effect, even on error
       setTimeout(() => {
         setIsGenerating(false)
         setIsTransitioning(false)
@@ -144,20 +148,23 @@ export default function Home() {
           {generatedImage ? (
             <div className="relative rounded-lg overflow-hidden shadow-lg">
               <img
-                src={generatedImage || "/placeholder.svg"}
+                src={generatedImage}
                 alt="Generated interior design"
                 className={cn(
                   "w-full h-auto object-cover transition-opacity duration-300",
                   isTransitioning ? "opacity-0" : "opacity-100",
                 )}
+                onError={(e) => {
+                   console.error("Failed to load generated image:", generatedImage);
+                   e.currentTarget.src = "/placeholder.svg";
+                   e.currentTarget.alt = "Failed to load generated image";
+                 }}
               />
-              <div className="absolute inset-0 flex items-center justify-center">
-                {isGenerating && (
-                  <div className="bg-background/80 p-4 rounded-full">
+              {isGenerating && (
+                <div className="absolute inset-0 flex items-center justify-center bg-background/50">
                     <Loader2 className="h-8 w-8 animate-spin text-primary" />
-                  </div>
-                )}
-              </div>
+                </div>
+              )}
             </div>
           ) : (
             <div className="border-2 border-dashed border-muted-foreground/20 rounded-lg p-12 text-center h-[500px] flex flex-col items-center justify-center">
