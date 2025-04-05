@@ -59,7 +59,7 @@ This server handles geometric validation and image mask manipulation.
 
 **Environment Variables:**
 
-A `.env.local` file in the root directory is required for API keys (e.g., `FAL_KEY`, `OPENAI_API_KEY`).
+A `.env.local` file in the root directory is required for API keys (e.g., `FAL_KEY`, `GEMINI_API_KEY`).
 
 ## Image Generation Pipeline (`/api/generateImage`)
 
